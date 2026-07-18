@@ -3741,8 +3741,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const spawnedCodexThreadIds = new Set(listSpawnedThreadIds());
     const codexThreads = listThreads(MAX_PROVIDER_SESSION_LIST_LIMIT);
     const codexThreadsById = new Map(codexThreads.map((thread) => [thread.id, thread]));
+    const claudeTranscriptRoot = config.claudeStrictMcpConfig
+      ? path.join(homedir(), ".claude", "projects")
+      : path.join(config.claudeConfigDir, "projects");
     const claudeTranscripts = config.enableClaudeProvider
-      ? listClaudeTranscriptSessions(MAX_PROVIDER_SESSION_LIST_LIMIT)
+      ? listClaudeTranscriptSessions(MAX_PROVIDER_SESSION_LIST_LIMIT, claudeTranscriptRoot)
       : [];
     const claudeTranscriptsBySessionId = new Map(
       claudeTranscripts.map((transcript) => [transcript.sessionId, transcript]),
@@ -8996,8 +8999,7 @@ type ClaudeTranscriptSessionSummary = {
   updatedAt: number;
 };
 
-function listClaudeTranscriptSessions(limit: number): ClaudeTranscriptSessionSummary[] {
-  const projectsDir = path.join(homedir(), ".claude", "projects");
+function listClaudeTranscriptSessions(limit: number, projectsDir: string): ClaudeTranscriptSessionSummary[] {
   if (!existsSync(projectsDir)) {
     return [];
   }
@@ -9054,6 +9056,7 @@ function readClaudeTranscriptSummary(file: { path: string; sessionId: string; up
   }
 
   let workspace = "";
+  let topicWorkspace = "";
   let explicitTitle = "";
   let fallbackTitle = "";
   let inspectedLines = 0;
@@ -9070,7 +9073,8 @@ function readClaudeTranscriptSummary(file: { path: string; sessionId: string; up
     }
 
     if (typeof entry.cwd === "string" && entry.cwd.trim()) {
-      workspace = entry.cwd;
+      workspace ||= entry.cwd;
+      topicWorkspace = entry.cwd;
     }
 
     if (entry.type === "ai-title" && typeof entry.aiTitle === "string" && entry.aiTitle.trim()) {
@@ -9097,7 +9101,12 @@ function readClaudeTranscriptSummary(file: { path: string; sessionId: string; up
     }
   }
 
-  const resolvedFallbackTitle = resolveClaudeTranscriptFallbackTitle(fallbackTitle, workspace);
+  // A Claude turn may cd into a project subfolder. That is useful as a topic
+  // hint, but it does not replace the provider session's original workspace.
+  const resolvedFallbackTitle = resolveClaudeTranscriptFallbackTitle(
+    fallbackTitle,
+    topicWorkspace || workspace,
+  );
 
   return {
     sessionId: file.sessionId,

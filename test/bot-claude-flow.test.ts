@@ -831,6 +831,34 @@ describe("Claude bot flow", () => {
     expect(list).toContain("Subagent child threads are omitted here");
   });
 
+  it("uses a nested Claude working directory as a title hint without replacing the session workspace", async () => {
+    const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
+    const nestedProject = path.join(tempDir, "accessible-weather");
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(
+      path.join(transcriptDir, "22222222-2222-4222-8222-222222222222.jsonl"),
+      [
+        JSON.stringify({
+          type: "user",
+          cwd: tempDir,
+          message: { content: "thinking about decimals in the observations and forecasts" },
+        }),
+        JSON.stringify({ type: "assistant", cwd: nestedProject, message: { content: "Working on it" } }),
+      ].join("\n"),
+      "utf8",
+    );
+    const { bot, sent } = await createTestBot(tempDir, { claudeStrictMcpConfig: false });
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(2, "/sessions"));
+
+    const list = sent.map((entry) => entry.text ?? "").find((text) => text.includes("Recent provider sessions"));
+    const weatherLine = list?.split("\n").find((line) => line.includes("Accessible weather"));
+    expect(weatherLine).toContain(`${path.basename(tempDir)}: Accessible weather`);
+    expect(weatherLine).not.toContain("accessible-weather: Accessible weather");
+  });
+
   it("passes sentences starting with shortcut words through to Claude", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 

@@ -1,5 +1,3 @@
-import type { ModelReasoningEffort } from "@openai/codex-sdk";
-
 import {
   buildAppServerEnv,
   type AppServerClientOptions,
@@ -33,6 +31,7 @@ import {
   type CodexThreadRecord,
 } from "./codex-state.js";
 import type { TeleCodeConfig } from "./config.js";
+import type { CodexReasoningEffort } from "./reasoning-effort.js";
 
 type AppServerThread = {
   id: string;
@@ -104,7 +103,7 @@ export class AppServerSessionService {
   private currentWorkspace: string;
   private currentThreadId: string | null = null;
   private currentModel: string | undefined;
-  private currentReasoningEffort: ModelReasoningEffort | undefined;
+  private currentReasoningEffort: CodexReasoningEffort | undefined;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
   private activeRunKind: ActiveRunKind | null = null;
@@ -132,7 +131,7 @@ export class AppServerSessionService {
     const service = new AppServerSessionService(config, options?.appServerClientFactory);
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
-    service.currentReasoningEffort = options?.reasoningEffort as ModelReasoningEffort | undefined;
+    service.currentReasoningEffort = options?.reasoningEffort as CodexReasoningEffort | undefined;
     service.currentLaunchProfile = getLaunchProfile(
       config,
       options?.launchProfileId ?? config.defaultLaunchProfileId,
@@ -657,7 +656,7 @@ export class AppServerSessionService {
     return text;
   }
 
-  setReasoningEffort(effort: ModelReasoningEffort): void {
+  setReasoningEffort(effort: CodexReasoningEffort): void {
     this.ensureIdle("change reasoning effort");
     this.currentReasoningEffort = effort;
   }

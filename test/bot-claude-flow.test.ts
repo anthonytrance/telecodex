@@ -813,9 +813,10 @@ describe("Claude bot flow", () => {
 
   it("shows the unified session list for /sessions while Claude is active", async () => {
     const { bot, sent } = await createTestBot(tempDir);
+    const prompt = "Hello there, I’m currently working on the weather app that gives me detailed observations from the area that I’m in in the world, and I want to improve it.";
 
-    await bot.handleUpdate(textUpdate(1, "/claude hello"));
-    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(1, `/claude ${prompt}`));
+    await waitFor(() => mockClaude.prompts.includes(prompt));
     await bot.handleUpdate(textUpdate(2, "/sessions"));
 
     expect(sent.map((entry) => entry.text)).not.toContain(
@@ -824,6 +825,10 @@ describe("Claude bot flow", () => {
     const list = sent.map((entry) => entry.text).find((text) => text?.includes("Recent provider sessions"));
     expect(list).toBeDefined();
     expect(list).toContain("Claude");
+    expect(list).toContain("Selected: #1, Claude");
+    expect(list).toContain("Weather app with detailed local observations");
+    expect(list?.match(/Weather app with detailed local observations/gu)).toHaveLength(1);
+    expect(list).toContain("Subagent child threads are omitted here");
   });
 
   it("passes sentences starting with shortcut words through to Claude", async () => {
@@ -897,6 +902,8 @@ describe("Claude bot flow", () => {
 
     await bot.handleUpdate(textUpdate(1, "/claude hello"));
     await waitFor(() => mockClaude.prompts.includes("hello"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to hello"));
+    await waitForAgentSessionsIdle(tempDir);
 
     await bot.handleUpdate(textUpdate(2, "/fork my experiment"));
     await waitFor(() => sent.some((entry) => entry.text?.includes("Forked this conversation")));
@@ -916,9 +923,14 @@ describe("Claude bot flow", () => {
 
     await bot.handleUpdate(textUpdate(1, "/claude first conversation"));
     await waitFor(() => mockClaude.prompts.includes("first conversation"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to first conversation"));
+    await waitForAgentSessionsIdle(tempDir);
     await bot.handleUpdate(textUpdate(2, "/fork second conversation"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Forked this conversation")));
     await bot.handleUpdate(textUpdate(3, "reply on the fork"));
     await waitFor(() => mockClaude.prompts.includes("reply on the fork"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to reply on the fork"));
+    await waitForAgentSessionsIdle(tempDir);
 
     await bot.handleUpdate(textUpdate(4, "/sessions"));
     const sessionList = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Recent provider sessions")).at(-1);
@@ -1102,7 +1114,7 @@ function textMessage(messageId: number, text: string) {
   };
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
     if (predicate()) {
@@ -1111,4 +1123,17 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");
+}
+
+async function waitForAgentSessionsIdle(workspace: string): Promise<void> {
+  await waitFor(() => {
+    try {
+      const state = JSON.parse(
+        readFileSync(path.join(workspace, ".telecode", "agent-sessions.json"), "utf8"),
+      ) as { sessions?: Array<{ status?: string }> };
+      return Boolean(state.sessions?.length) && state.sessions!.every((session) => session.status !== "running");
+    } catch {
+      return false;
+    }
+  });
 }

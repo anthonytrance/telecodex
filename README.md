@@ -18,7 +18,7 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
 - **Voice transcription** — send a voice message or audio file; TeleCode transcribes it (faster-whisper, parakeet-coreml, or OpenAI Whisper) and forwards the text
 - **Image input** — send a photo (with optional caption) to pass screenshots or images to the agent
 - **File ingest & artifacts** — send a document to stage it in the workspace; generated files are delivered back as Telegram documents
-- **Session browser** — `/sessions` lists recent threads grouped by workspace; switch with a tap or `/use <n>`
+- **Session browser** — `/sessions` combines top-level Codex threads and Claude transcripts, with concise topic titles and child workers kept out of the main list
 - **Telegram login** — `/login` runs the Codex device-auth flow, `/claude_login` the Claude Code login, no terminal needed
 - **Launch profiles** — `/launch_profiles` selects the sandbox + approval mode for new or reattached Codex threads
 - **Model picker & reasoning effort** — `/model` and `/effort` per context
@@ -120,7 +120,7 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
 | `/renamethread <name>` | Rename the active app-server thread |
 | `/rollbackthread <n>` | Roll back app-server thread history by `n` turns; file changes are not reverted |
 | `/session` | Current thread ID, workspace, model, effort, and token totals (`/status` alias) |
-| `/sessions` | Browse recent threads grouped by workspace; tap to switch |
+| `/sessions [all]` | Browse top-level Codex and Claude sessions; `all` shows up to 500 sessions |
 | `/use <n\|previous\|latest>` | Switch sessions after `/sessions` |
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/history` | Show recent local thread history |
@@ -143,7 +143,7 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
 | Command | Description |
 |---|---|
 | `/model [slug]` | View and change the model (applies to the active provider) |
-| `/effort [level]` | Reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |
+| `/effort [level]` | Model-supported reasoning effort, including `max` and `ultra` when advertised by the local Codex model catalog |
 | `/backend` | Show or switch the backend: Codex `sdk`/`appserver`, Claude `pty`/`sdk` |
 | `/verbosity <mode>` | Progress delivery for this context: `messages`, `edit`, or `none` |
 | `/launch_profiles [id]` | Select the sandbox + approval profile for new Codex threads |
@@ -210,6 +210,8 @@ When a provider finishes in the background (you switched providers or sessions m
 Each Telegram chat or forum topic is identified by a **context key** — the chat ID alone for private chats, or `chatId:threadId` for forum topics. Every topic in a supergroup gets its own independent sessions, and each context tracks busy state separately, so a running prompt in one topic doesn't block another.
 
 Within a context, TeleCode keeps a lane of provider sessions. The **selected** session receives your messages; other sessions keep running in the background and buffer their output. `/sessions`, `/use`, `/switch`, and `/provider` move the selection.
+
+The main session browser uses the providers' canonical thread or transcript timestamps, so startup metadata repairs do not make old sessions appear new. Spawned Codex subagent threads are omitted from `/sessions` and remain available through `/children` while their parent Codex session is selected. Long first prompts are reduced to concise topic labels, while explicit thread names from `/renamethread` are preserved.
 
 Session metadata (thread ID, workspace, launch profile, model, effort, backend, active provider) is persisted to `.telecode/contexts.json` and restored on restart, so threads survive bot reboots. On first startup after upgrading from the legacy TeleCodex naming, a `.telecodex` state directory is migrated automatically; legacy `TELECODEX_*` environment variables remain accepted.
 

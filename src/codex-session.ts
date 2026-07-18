@@ -25,6 +25,7 @@ import {
   formatLaunchProfileBehavior,
   type CodexLaunchProfile,
 } from "./codex-launch.js";
+import type { CodexReasoningEffort } from "./reasoning-effort.js";
 
 export type CodexTextDeltaMetadata = {
   phase?: string | null;
@@ -116,7 +117,7 @@ export class CodexSessionService {
   private abortController: AbortController | null = null;
   private currentThreadId: string | null = null;
   private currentModel: string | undefined;
-  private currentReasoningEffort: ModelReasoningEffort | undefined;
+  private currentReasoningEffort: CodexReasoningEffort | undefined;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
   private sessionTokens = { input: 0, cached: 0, output: 0 };
@@ -130,7 +131,7 @@ export class CodexSessionService {
     const service = new CodexSessionService(config);
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
-    service.currentReasoningEffort = options?.reasoningEffort as ModelReasoningEffort | undefined;
+    service.currentReasoningEffort = options?.reasoningEffort as CodexReasoningEffort | undefined;
     service.currentLaunchProfile = getLaunchProfile(
       config,
       options?.launchProfileId ?? config.defaultLaunchProfileId,
@@ -442,7 +443,7 @@ export class CodexSessionService {
     }
   }
 
-  setReasoningEffort(effort: ModelReasoningEffort): void {
+  setReasoningEffort(effort: CodexReasoningEffort): void {
     this.ensureIdle("change reasoning effort");
     this.currentReasoningEffort = effort;
     if (this.currentThreadId) {
@@ -544,7 +545,9 @@ export class CodexSessionService {
     if (this.currentReasoningEffort) {
       return {
         ...options,
-        modelReasoningEffort: this.currentReasoningEffort,
+        // The installed SDK's declaration can lag the CLI model catalog. The CLI
+        // accepts newer catalog-advertised levels such as max and ultra.
+        modelReasoningEffort: this.currentReasoningEffort as ModelReasoningEffort,
       };
     }
 

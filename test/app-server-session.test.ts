@@ -175,6 +175,7 @@ describe("AppServerSessionService", () => {
 
     const service = await AppServerSessionService.create(createConfig(), {
       appServerClientFactory: () => client!,
+      reasoningEffort: "max",
     });
     const events: string[] = [];
 
@@ -195,12 +196,14 @@ describe("AppServerSessionService", () => {
       threadId: "thread-1",
       workspace: "/workspace/project",
       model: "gpt-test",
+      reasoningEffort: "max",
     });
     expect(client.requests.find((request) => request.method === "turn/start")?.params).toMatchObject({
       threadId: "thread-1",
       cwd: "/workspace/project",
       approvalPolicy: "never",
       model: "gpt-test",
+      effort: "max",
       input: [
         { type: "text", text: "read file\n\nhello", text_elements: [] },
         { type: "localImage", path: "/tmp/image.png" },

@@ -15,6 +15,7 @@ export interface ClaudePromptQueueEntry {
   text: string;
   queuedAt: number;
   kind?: ClaudeQueuedPromptKind;
+  deliveryFailures?: number;
 }
 
 interface ClaudePromptQueueState {
@@ -132,5 +133,7 @@ function isClaudePromptQueueEntry(value: unknown): value is ClaudePromptQueueEnt
     entry.text.length > 0 &&
     Number.isFinite(entry.queuedAt) &&
     (entry.messageThreadId === undefined || Number.isInteger(entry.messageThreadId)) &&
-    (entry.kind === undefined || entry.kind === "prompt" || entry.kind === "steer");
+    (entry.kind === undefined || entry.kind === "prompt" || entry.kind === "steer") &&
+    (entry.deliveryFailures === undefined ||
+      (Number.isInteger(entry.deliveryFailures) && entry.deliveryFailures >= 0));
 }

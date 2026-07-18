@@ -217,7 +217,7 @@ export function formatSessionLabel(
 ): string {
   const prefix = options.isActive ? "✅" : "📁";
   const workspaceName = trimLabel(getWorkspaceShortName(options.workspace), 12) || "(unknown)";
-  const title = trimLabel(cleanSessionTitle(options.title) || "(untitled)", 20) || "(untitled)";
+  const title = trimLabel(deriveSessionTitle(options.title) || "(untitled)", 20) || "(untitled)";
   const time = options.relativeTime;
 
   let label = `${prefix} ${workspaceName} · ${title} · ${time}`;
@@ -248,12 +248,77 @@ export function cleanSessionTitle(title: string): string {
   return normalized;
 }
 
+/**
+ * Turn a raw first prompt into a short, screen-reader-friendly topic label.
+ * Explicit short names are left alone; conversational request wrappers and
+ * long prompt details are removed without making another model request.
+ */
+export function deriveSessionTitle(title: string, maxLength = 72): string {
+  let normalized = cleanSessionTitle(title)
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) {
+    return "";
+  }
+  const original = normalized;
+
+  normalized = normalized
+    .replace(/^(?:hello|hi|hey)(?: there)?[,.!:\s-]*/i, "")
+    .replace(/^(?:please\s+|can you(?: please)?\s+|could you(?: please)?\s+|would you(?: please)?\s+)/i, "")
+    .replace(/^i(?:['’]d| would) like (?:you )?to\s+/i, "")
+    .replace(/^i (?:want|need) (?:you )?to\s+/i, "")
+    .replace(
+      /^there(?:['’]s| is) (?:another |a |an )?(?:problem|issue) (?:with|in) [^,]{1,100},\s*(?:which is that\s+)?(?:the\s+)?/i,
+      "",
+    )
+    .trim();
+
+  const workMatch = normalized.match(
+    /\b(?:i(?:['’]m| am)|we(?:['’]re| are)) (?:currently )?(?:working|busy) (?:on|with) (?:the )?([^.!?]{8,180})/i,
+  );
+  if (workMatch?.[1] && (workMatch.index ?? 0) < 100) {
+    normalized = workMatch[1].trim();
+  }
+
+  normalized = normalized
+    .replace(/\bthat gives me detailed observations from the area that i(?:['’]m| am) in(?: in the world)?/i, "with detailed local observations")
+    .replace(/\s+(?:and|but)\s+(?:also\s+)?(?:i|we)\s+(?:want|need|was|were|am|are)\b[\s\S]*$/i, "")
+    .replace(/\s+(?:and|but)\s+it\s+(?:also\s+)?(?:includes?|keeps?|shows?|lists?|says?|does|is|has|was)\b[\s\S]*$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/[,:;\s-]+$/g, "")
+    .trim();
+
+  const firstSentence = normalized.match(/^(.{12,}?)(?:[.!?](?:\s|$)|$)/u)?.[1]?.trim();
+  if (firstSentence) {
+    normalized = firstSentence;
+  }
+
+  const shortened = trimAtWordBoundary(normalized, maxLength);
+  if (!shortened) {
+    return "";
+  }
+  return normalized !== original
+    ? `${shortened[0]?.toUpperCase() ?? ""}${shortened.slice(1)}`
+    : shortened;
+}
+
 function trimLabel(text: string, maxLength: number): string {
   const singleLine = text.replace(/\s+/g, " ").trim();
   if (singleLine.length <= maxLength) {
     return singleLine;
   }
   return `${singleLine.slice(0, maxLength - 1)}…`;
+}
+
+function trimAtWordBoundary(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  const slice = text.slice(0, Math.max(1, maxLength + 1));
+  const lastSpace = slice.lastIndexOf(" ");
+  const boundary = lastSpace >= Math.floor(maxLength * 0.6) ? lastSpace : maxLength;
+  return text.slice(0, boundary).replace(/[,:;\s-]+$/g, "").trim();
 }
 
 function getWorkspaceShortName(workspace: string): string {

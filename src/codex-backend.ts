@@ -1,5 +1,3 @@
-import type { ModelReasoningEffort } from "@openai/codex-sdk";
-
 import { AppServerSessionService } from "./app-server-session.js";
 import type { CodexLaunchProfile } from "./codex-launch.js";
 import {
@@ -13,6 +11,7 @@ import {
 } from "./codex-session.js";
 import type { TeleCodeConfig } from "./config.js";
 import type { CodexModelRecord, CodexThreadRecord } from "./codex-state.js";
+import type { CodexReasoningEffort } from "./reasoning-effort.js";
 
 export interface CodexSessionRuntime {
   getInfo(): CodexSessionInfo;
@@ -43,7 +42,7 @@ export interface CodexSessionRuntime {
   listModels(): CodexModelRecord[];
   setModel(slug: string): string;
   runText(input: CodexPromptInput): Promise<string>;
-  setReasoningEffort(effort: ModelReasoningEffort): void;
+  setReasoningEffort(effort: CodexReasoningEffort): void;
   setLaunchProfile(profileId: string): CodexLaunchProfile;
   getSelectedLaunchProfile(): CodexLaunchProfile;
   handback(): { threadId: string | null; workspace: string };

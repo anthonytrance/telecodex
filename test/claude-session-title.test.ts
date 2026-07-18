@@ -1,4 +1,8 @@
-import { isUsefulClaudeSessionTitle, provisionalClaudeTitle } from "../src/bot.js";
+import {
+  isUsefulClaudeSessionTitle,
+  provisionalClaudeTitle,
+  resolveClaudeTranscriptFallbackTitle,
+} from "../src/bot.js";
 
 describe("Claude session titles", () => {
   it("does not let model commands or picker replies become session topics", () => {
@@ -15,5 +19,19 @@ describe("Claude session titles", () => {
   it("rejects transcript plumbing even after XML tags are removed", () => {
     const raw = "<task-notification><summary>background job finished</summary></task-notification>";
     expect(isUsefulClaudeSessionTitle("background job finished", raw)).toBe(false);
+  });
+
+  it("uses a descriptive project folder when a resumed transcript starts mid-thought", () => {
+    expect(resolveClaudeTranscriptFallbackTitle(
+      "thinking about whenever decimals are possible in the observations",
+      "C:\\Users\\Anthony\\codetest\\accessible-weather",
+    )).toBe("Accessible weather");
+  });
+
+  it("keeps a meaningful prompt title instead of replacing it with the project folder", () => {
+    expect(resolveClaudeTranscriptFallbackTitle(
+      "Build and package the YouTube clipper",
+      "C:\\Users\\Anthony\\codetest\\youtube-clipper",
+    )).toBe("Build and package the YouTube clipper");
   });
 });

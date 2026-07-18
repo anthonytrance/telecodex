@@ -27,6 +27,7 @@ type LoadOptions = {
   modelsJson?: string;
   betterSqliteAvailable?: boolean;
   openThrows?: boolean;
+  spawnTableMissing?: boolean;
 };
 
 const originalHome = process.env.HOME;
@@ -96,6 +97,9 @@ async function loadCodexState(options: LoadOptions = {}) {
         }
 
         prepare(sql: string) {
+          if (options.spawnTableMissing && sql.includes("thread_spawn_edges")) {
+            throw new Error("no such table: thread_spawn_edges");
+          }
           return {
             all: (...args: unknown[]) => runAllQuery(sql, threads, spawnEdges, args),
             get: (...args: unknown[]) => runGetQuery(sql, threads, spawnEdges, args),
@@ -122,7 +126,12 @@ function runAllQuery(
       .map((cwd) => ({ cwd }));
   }
 
-  if (sql.includes("FROM thread_spawn_edges")) {
+  if (sql.includes("SELECT DISTINCT child_thread_id")) {
+    return [...new Set(spawnEdges.map((edge) => edge.childThreadId))]
+      .map((child_thread_id) => ({ child_thread_id }));
+  }
+
+  if (sql.includes("FROM thread_spawn_edges e") && sql.includes("JOIN threads t")) {
     const parentThreadId = String(args[0] ?? "");
     return spawnEdges
       .filter((edge) => edge.parentThreadId === parentThreadId)
@@ -327,7 +336,15 @@ describe("codex-state", () => {
     const state = await loadCodexState({
       modelsJson: JSON.stringify({
         models: [
-          { slug: "gpt-5.4", display_name: "GPT-5.4" },
+          {
+            slug: "gpt-5.4",
+            display_name: "GPT-5.4",
+            supported_reasoning_levels: [
+              { effort: "high" },
+              { effort: "max" },
+              { effort: "not-a-real-level" },
+            ],
+          },
           { slug: "secret", display_name: "Secret", visibility: "hidden" },
           { slug: "o3", display_name: "o3", visibility: "public" },
         ],
@@ -335,8 +352,8 @@ describe("codex-state", () => {
     });
 
     expect(state.listModels()).toEqual([
-      { slug: "gpt-5.4", displayName: "GPT-5.4" },
-      { slug: "o3", displayName: "o3" },
+      { slug: "gpt-5.4", displayName: "GPT-5.4", supportedReasoningEfforts: ["high", "max"] },
+      { slug: "o3", displayName: "o3", supportedReasoningEfforts: [] },
     ]);
   });
 
@@ -352,6 +369,55 @@ describe("codex-state", () => {
     const state = await loadCodexState({ files: ["state_main.sqlite"], threads: [] });
 
     expect(state.getThread("missing")).toBeNull();
+  });
+
+  it("listThreads omits spawned child threads from the top-level session list", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threads: [
+        {
+          id: "parent-thread",
+          title: "Main task",
+          cwd: "/workspace",
+          model: "gpt-5.6-sol",
+          created_at: 10,
+          updated_at: 20,
+          first_user_message: "main",
+        },
+        {
+          id: "child-thread",
+          title: "Ultra worker",
+          cwd: "/workspace",
+          model: "gpt-5.6-sol",
+          created_at: 11,
+          updated_at: 30,
+          first_user_message: "worker",
+        },
+      ],
+      spawnEdges: [{ parentThreadId: "parent-thread", childThreadId: "child-thread", status: "completed" }],
+    });
+
+    expect(state.listThreads().map((thread) => thread.id)).toEqual(["parent-thread"]);
+    expect(state.listSpawnedThreadIds()).toEqual(["child-thread"]);
+  });
+
+  it("listThreads still works with an older database that has no spawn-edge table", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      spawnTableMissing: true,
+      threads: [{
+        id: "legacy-thread",
+        title: "Legacy",
+        cwd: "/workspace",
+        model: "gpt-5.4",
+        created_at: 10,
+        updated_at: 20,
+        first_user_message: "legacy",
+      }],
+    });
+
+    expect(state.listThreads().map((thread) => thread.id)).toEqual(["legacy-thread"]);
+    expect(state.listSpawnedThreadIds()).toEqual([]);
   });
 
   it("lists child threads for a parent thread", async () => {

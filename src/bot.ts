@@ -6,7 +6,6 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
-import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import * as pty from "node-pty";
 
@@ -36,6 +35,7 @@ import { AgentSessionManager, type AgentJobRecord, type AgentSessionRecord } fro
 import { agentSessionStatePath, JsonAgentSessionStore } from "./agent-session-store.js";
 import {
   cleanSessionTitle,
+  deriveSessionTitle,
   formatSessionLabel,
   renderHelpMessage,
   renderWelcomeFirstTime,
@@ -64,6 +64,7 @@ import {
   getThread,
   getThreadByPrefix,
   listChildThreads,
+  listSpawnedThreadIds,
   listThreads,
   readThreadHistory,
   type CodexThreadRecord,
@@ -74,6 +75,12 @@ import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { applyGoalModeConstraints, formatThreadGoal, parseGoalModeArgument } from "./goal-mode.js";
 import { OutputBuffer, type BufferedOutputEvent } from "./output-buffer.js";
+import {
+  CODEX_REASONING_EFFORTS,
+  LEGACY_CODEX_REASONING_EFFORTS,
+  isCodexReasoningEffort,
+  type CodexReasoningEffort,
+} from "./reasoning-effort.js";
 import { ClaudeProviderAdapter, PromptNotDeliveredError } from "./providers/claude-adapter.js";
 import { classifyClaudeSlashCommand } from "./providers/claude-commands.js";
 import { claudeProcessRegistryPath } from "./providers/claude-process-registry.js";
@@ -113,12 +120,13 @@ const KEYBOARD_PAGE_SIZE = 6;
 const CLAUDE_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r/g;
 const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 20;
-const MAX_PROVIDER_SESSION_LIST_LIMIT = 50;
+const MAX_PROVIDER_SESSION_LIST_LIMIT = 500;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
 const CLAUDE_QUIET_WARNING_PREFIX = "Claude has been quiet for ";
 // How long an unanswered idle-steer y/n question stays valid.
 const IDLE_STEER_CONFIRM_TTL_MS = 5 * 60 * 1000;
+const MAX_CLAUDE_PROMPT_DELIVERY_FAILURES = 3;
 const NATIVE_CODEX_COMMANDS = [
   "compact",
   "agents",
@@ -215,6 +223,7 @@ type ClaudePromptRunSource = {
   ctx?: Context;
   chatId: TelegramChatId;
   messageThreadId?: number;
+  queueEntry?: ClaudePromptQueueEntry;
 };
 
 type PendingClaudeLogin = {
@@ -1290,7 +1299,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     source: ClaudePromptRunSource,
     contextKey: TelegramContextKey,
     text: string,
-    options: { kind?: ClaudeQueuedPromptKind; front?: boolean } = {},
+    options: { kind?: ClaudeQueuedPromptKind; front?: boolean; deliveryFailures?: number } = {},
   ): number => {
     const queuedText = options.kind === "steer"
       ? `Additional instruction for the previous Claude task:\n\n${text}`
@@ -1303,6 +1312,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       text: queuedText,
       queuedAt: Date.now(),
       kind: options.kind ?? "prompt",
+      deliveryFailures: options.deliveryFailures,
     };
     const depth = options.front
       ? queuedClaudePrompts.enqueueFront(entry)
@@ -1388,6 +1398,50 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         messageThreadId: source.messageThreadId,
       });
     }
+  };
+
+  const routeClaudeSteer = async (
+    source: ClaudePromptRunSource,
+    contextKey: TelegramContextKey,
+    prompt: string,
+  ): Promise<void> => {
+    const messageThreadId = source.messageThreadId ?? parseContextKey(contextKey).messageThreadId;
+    if (isProviderBusy(contextKey, "claude") || getBusyState(contextKey).processing) {
+      const descriptor = claudeSessions.get(contextKey);
+      if (descriptor && claudeAdapter?.streamInput) {
+        try {
+          // SDK turns receive priority-now input. PTY turns receive normal typed
+          // input, which Claude applies at its next safe interaction boundary.
+          await claudeAdapter.streamInput(descriptor.id, { text: prompt });
+          const sent = "Steer sent to the active Claude turn.";
+          await replyToClaudeRunSource(source, escapeHTML(sent), { fallbackText: sent, messageThreadId });
+          return;
+        } catch (error) {
+          bridgeLog("steer", `live Claude steer failed lane=${contextKey}: ${String(error)}`);
+        }
+      }
+
+      if (source.ctx) {
+        await queueClaudePromptReply(source.ctx, contextKey, source.chatId, prompt, { kind: "steer" });
+      } else {
+        enqueueClaudePromptFromSource(source, contextKey, prompt, { kind: "steer" });
+      }
+      return;
+    }
+
+    if (source.ctx) {
+      pendingIdleSteers.set(contextKey, {
+        text: prompt,
+        provider: "claude",
+        expiresAt: Date.now() + IDLE_STEER_CONFIRM_TTL_MS,
+      });
+      const message = "No Claude turn is running. Reply y to start a new turn with this steer text, or n to discard it.";
+      await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    const message = "No Claude turn is running, so this steer instruction was not sent.";
+    await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
   };
 
   const setClaudeRunReaction = async (
@@ -2499,6 +2553,18 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     text: string,
   ): Promise<void> => {
     const messageThreadId = source.messageThreadId ?? parseContextKey(contextKey).messageThreadId;
+    const steerPrompt = parseSteerCommandText(text);
+    if (steerPrompt !== undefined) {
+      if (!steerPrompt) {
+        const usage = "Usage: /steer <instruction>";
+        await replyToClaudeRunSource(source, escapeHTML(usage), { fallbackText: usage, messageThreadId });
+      } else {
+        // Defensive routing for restored or externally injected Telegram updates:
+        // never paste the Telegram /steer command itself into Claude Code.
+        await routeClaudeSteer(source, contextKey, steerPrompt);
+      }
+      return;
+    }
     const busyState = getBusyState(contextKey);
     bridgeLog("intake", `message received lane=${contextKey} chars=${text.length}`);
 
@@ -2982,19 +3048,34 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       console.error("Claude prompt failed:", error);
       bridgeLog("error", `claude turn failed lane=${contextKey}: ${String(error)}`);
       if (error instanceof PromptNotDeliveredError) {
-        // Requeue the user's text, not the delivered prompt: the delivered prompt carries
-        // this turn's outbox instruction, and the retry turn appends its own.
-        enqueueClaudePromptFromSource(source, contextKey, stripOutputFilesInstruction(error.promptText), { front: true });
-        deferQueuedDispatch = true;
-        const queuedMessage = "Claude did not accept the message yet. I put it back at the front of the Claude queue and will retry after the current session becomes idle.";
-        await replyToClaudeRunSource(source, escapeHTML(queuedMessage), {
-          fallbackText: queuedMessage,
-          messageThreadId,
-        });
-        const retryTimer = setTimeout(() => {
-          dispatchNextQueuedClaudePrompt(contextKey);
-        }, 30000);
-        retryTimer.unref?.();
+        const deliveryFailures = (source.queueEntry?.deliveryFailures ?? 0) + 1;
+        const terminalCommandFailure = /Unknown command:|Args from unknown skill:/i.test(error.message);
+        if (!terminalCommandFailure && deliveryFailures < MAX_CLAUDE_PROMPT_DELIVERY_FAILURES) {
+          // Requeue the user's text, not the delivered prompt: the delivered prompt carries
+          // this turn's outbox instruction, and the retry turn appends its own.
+          enqueueClaudePromptFromSource(source, contextKey, stripOutputFilesInstruction(error.promptText), {
+            front: true,
+            deliveryFailures,
+          });
+          deferQueuedDispatch = true;
+          const queuedMessage = `Claude did not accept the message yet. I will retry when the session is idle, attempt ${deliveryFailures + 1} of ${MAX_CLAUDE_PROMPT_DELIVERY_FAILURES}.`;
+          await replyToClaudeRunSource(source, escapeHTML(queuedMessage), {
+            fallbackText: queuedMessage,
+            messageThreadId,
+          });
+          const retryTimer = setTimeout(() => {
+            dispatchNextQueuedClaudePrompt(contextKey);
+          }, 30000);
+          retryTimer.unref?.();
+        } else {
+          const stoppedMessage = terminalCommandFailure
+            ? "Claude rejected that input as an invalid command. I stopped automatic retries. Use /retry after correcting the message."
+            : `Claude did not accept the message after ${MAX_CLAUDE_PROMPT_DELIVERY_FAILURES} attempts. I stopped automatic retries. Use /retry to try it again manually.`;
+          await replyToClaudeRunSource(source, escapeHTML(stoppedMessage), {
+            fallbackText: stoppedMessage,
+            messageThreadId,
+          });
+        }
         await clearClaudeRunReaction(source);
         return;
       }
@@ -3064,6 +3145,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       ctx,
       chatId: entry.chatId,
       messageThreadId: entry.messageThreadId,
+      queueEntry: entry,
     }, entry.contextKey, entry.text).catch((error) => {
       console.error("Queued Claude prompt task failed:", error);
     });
@@ -3656,6 +3738,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   ): ProviderSessionPick[] => {
     const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
     const picksByKey = new Map<string, ProviderSessionPick>();
+    const spawnedCodexThreadIds = new Set(listSpawnedThreadIds());
+    const codexThreads = listThreads(MAX_PROVIDER_SESSION_LIST_LIMIT);
+    const codexThreadsById = new Map(codexThreads.map((thread) => [thread.id, thread]));
     const claudeTranscripts = config.enableClaudeProvider
       ? listClaudeTranscriptSessions(MAX_PROVIDER_SESSION_LIST_LIMIT)
       : [];
@@ -3665,6 +3750,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     let repairedClaudeTitle = false;
 
     for (const session of agentSessions.listLaneSessions(contextKey)) {
+      if (session.provider === "codex" && session.providerSessionId && spawnedCodexThreadIds.has(session.providerSessionId)) {
+        continue;
+      }
       let sessionForPick = session;
       if (session.provider === "claude" && session.providerSessionId) {
         const transcript = claudeTranscriptsBySessionId.get(session.providerSessionId);
@@ -3673,14 +3761,35 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           repairedClaudeTitle = true;
         }
       }
-      const pick = providerSessionPickFromAgentSession(sessionForPick);
+      let pick = providerSessionPickFromAgentSession(sessionForPick);
+      if (session.provider === "codex" && session.providerSessionId) {
+        const thread = codexThreadsById.get(session.providerSessionId);
+        if (thread) {
+          pick = {
+            ...pick,
+            title: resolveCodexThreadTitle(thread),
+            workspace: thread.cwd,
+            updatedAt: thread.updatedAt.getTime(),
+          };
+        }
+      } else if (session.provider === "claude" && session.providerSessionId) {
+        const transcript = claudeTranscriptsBySessionId.get(session.providerSessionId);
+        if (transcript) {
+          pick = {
+            ...pick,
+            title: transcript.title,
+            workspace: transcript.workspace,
+            updatedAt: transcript.updatedAt,
+          };
+        }
+      }
       picksByKey.set(providerSessionPickKey(pick), pick);
     }
     if (repairedClaudeTitle) {
       persistAgentSessionState();
     }
 
-    for (const thread of listThreads(MAX_PROVIDER_SESSION_LIST_LIMIT)) {
+    for (const thread of codexThreads) {
       const pick = providerSessionPickFromCodexThread(thread);
       if (!picksByKey.has(providerSessionPickKey(pick))) {
         picksByKey.set(providerSessionPickKey(pick), pick);
@@ -3751,10 +3860,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
     pendingAgentSessionPicks.set(contextKey, picks);
     const lines = [
-      `Recent provider sessions. Showing ${picks.length}. Selected: ${formatSelectedProviderSessionLabel(picks, lane.selectedSessionId)}.`,
+      `Recent provider sessions (top-level only). Showing ${picks.length}. Selected: ${formatSelectedProviderSessionLabel(picks, lane.selectedSessionId)}.`,
       ...picks.map((pick, index) => formatProviderSessionPickLine(index + 1, pick, lane.selectedSessionId)),
       "",
-      limit < MAX_PROVIDER_SESSION_LIST_LIMIT ? "Use /sessions 50 for more." : undefined,
+      limit < MAX_PROVIDER_SESSION_LIST_LIMIT ? `Use /sessions all for up to ${MAX_PROVIDER_SESSION_LIST_LIMIT} sessions.` : undefined,
+      "Subagent child threads are omitted here; use /children while a Codex session is selected.",
       "Use /switch 1 or /use 1. Use /session for technical IDs.",
     ];
     return lines.filter((line): line is string => Boolean(line)).join("\n");
@@ -4550,29 +4660,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const rawContextKey = contextKeyFromCtx(ctx);
     const chatId = ctx.chat?.id;
     if (rawContextKey && chatId && isClaudeActive(rawContextKey)) {
-      if (isProviderBusy(rawContextKey, "claude") || getBusyState(rawContextKey).processing) {
-        const descriptor = claudeSessions.get(rawContextKey);
-        if (descriptor && claudeAdapter?.streamInput) {
-          try {
-            await claudeAdapter.streamInput(descriptor.id, { text: prompt });
-            await safeReply(ctx, escapeHTML("Steer sent to the active Claude turn."), {
-              fallbackText: "Steer sent to the active Claude turn.",
-            });
-            return;
-          } catch (error) {
-            bridgeLog("steer", `live Claude steer failed lane=${rawContextKey}: ${String(error)}`);
-          }
-        }
-        await queueClaudePromptReply(ctx, rawContextKey, chatId, prompt, { kind: "steer" });
-        return;
-      }
-      pendingIdleSteers.set(rawContextKey, {
-        text: prompt,
-        provider: "claude",
-        expiresAt: Date.now() + IDLE_STEER_CONFIRM_TTL_MS,
-      });
-      const message = "No Claude turn is running. Reply y to start a new turn with this steer text, or n to discard it.";
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      await routeClaudeSteer({
+        ctx,
+        chatId,
+        messageThreadId: parseContextKey(rawContextKey).messageThreadId,
+      }, rawContextKey, prompt);
       return;
     }
 
@@ -6423,10 +6515,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
 
     const normalized = effortText.trim().toLowerCase();
-    const efforts: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
-    if (!efforts.includes(normalized as ModelReasoningEffort)) {
-      await safeReply(ctx, escapeHTML("Usage: /effort minimal|low|medium|high|xhigh"), {
-        fallbackText: "Usage: /effort minimal|low|medium|high|xhigh",
+    if (!isCodexReasoningEffort(normalized)) {
+      const usage = `Usage: /effort ${CODEX_REASONING_EFFORTS.join("|")}`;
+      await safeReply(ctx, escapeHTML(usage), {
+        fallbackText: usage,
       });
       return true;
     }
@@ -6437,6 +6529,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
 
     const { contextKey, session } = contextSession;
+    const efforts = reasoningEffortsForSession(session);
+    if (!efforts.includes(normalized)) {
+      const model = session.getInfo().model ?? "the current model";
+      const message = `${normalized} is not advertised for ${model}. Supported levels: ${efforts.join(", ")}.`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return true;
+    }
     if (isBusy(contextKey)) {
       await safeReply(ctx, escapeHTML("Cannot change effort while a prompt is running."), {
         fallbackText: "Cannot change effort while a prompt is running.",
@@ -6444,7 +6543,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return true;
     }
 
-    session.setReasoningEffort(normalized as ModelReasoningEffort);
+    session.setReasoningEffort(normalized);
     updateSessionMetadata(contextKey, session);
     const text = `Reasoning effort set to ${normalized}. It applies from the next turn in this context.`;
     await safeReply(ctx, escapeHTML(text), { fallbackText: text });
@@ -6476,7 +6575,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
 
     const { contextKey, session } = contextSession;
-    const efforts: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
+    const efforts = reasoningEffortsForSession(session);
     const current = session.getInfo().reasoningEffort;
     const effortButtons = efforts.map((effort) => ({
       label: effort === current ? `${effort} ✓` : effort,
@@ -6502,8 +6601,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   bot.hears(/^effort\s+(\S+)/i, async (ctx, next) => {
     const rawContextKey = contextKeyFromCtx(ctx);
     const level = (ctx.match[1] ?? "").trim().toLowerCase();
-    const validLevels = new Set(["minimal", "low", "medium", "high", "xhigh"]);
-    if (!rawContextKey || isClaudeActive(rawContextKey) || !validLevels.has(level)) {
+    if (!rawContextKey || isClaudeActive(rawContextKey) || !isCodexReasoningEffort(level)) {
       // Not a shortcut: let the message reach the agent as a normal prompt.
       await next();
       return;
@@ -6993,10 +7091,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
   });
 
-  bot.callbackQuery(/^effort_(minimal|low|medium|high|xhigh)$/, async (ctx) => {
+  bot.callbackQuery(/^effort_(minimal|low|medium|high|xhigh|max|ultra)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
     const messageId = ctx.callbackQuery.message?.message_id;
-    const effort = ctx.match?.[1] as ModelReasoningEffort | undefined;
+    const effort = ctx.match?.[1] as CodexReasoningEffort | undefined;
 
     if (!chatId || !messageId || !effort) {
       return;
@@ -8399,6 +8497,24 @@ function getCommandArgument(ctx: Context): string {
   return text.replace(/^\/\S+\s*/u, "").trim();
 }
 
+function parseSteerCommandText(text: string): string | undefined {
+  const match = text.match(/^\/steer(?:@\w+)?(?:\s+([\s\S]*))?$/iu);
+  if (!match) {
+    return undefined;
+  }
+  return (match[1] ?? "").trim();
+}
+
+function reasoningEffortsForSession(session: CodexSessionRuntime): CodexReasoningEffort[] {
+  const currentModel = session.getInfo().model;
+  const model = currentModel
+    ? session.listModels().find((candidate) => candidate.slug === currentModel)
+    : undefined;
+  return model?.supportedReasoningEfforts?.length
+    ? [...model.supportedReasoningEfforts]
+    : [...LEGACY_CODEX_REASONING_EFFORTS];
+}
+
 function stripTerminalText(text: string): string {
   return text.replace(ANSI_PATTERN, "");
 }
@@ -8652,7 +8768,7 @@ function providerSessionPickFromCodexThread(thread: CodexThreadRecord): Provider
     kind: "codex-thread",
     thread,
     provider: "codex",
-    title: cleanProviderSessionTitle(thread.title || thread.firstUserMessage || "Codex thread"),
+    title: resolveCodexThreadTitle(thread),
     workspace: thread.cwd,
     updatedAt: thread.updatedAt.getTime(),
     status: "old",
@@ -8687,7 +8803,7 @@ function providerSessionPickAgentId(pick: ProviderSessionPick): string | undefin
 function resolveCodexSessionDisplayName(threadId: string | null | undefined, fallback: string): string {
   if (threadId) {
     const thread = getThread(threadId);
-    const title = thread ? cleanProviderSessionTitle(thread.title || thread.firstUserMessage || "") : "";
+    const title = thread ? resolveCodexThreadTitle(thread) : "";
     if (title && title !== "(untitled)") {
       return title;
     }
@@ -8695,6 +8811,21 @@ function resolveCodexSessionDisplayName(threadId: string | null | undefined, fal
 
   const fallbackTitle = cleanProviderSessionTitle(fallback);
   return fallbackTitle === "(untitled)" ? "Codex" : fallbackTitle;
+}
+
+function resolveCodexThreadTitle(thread: CodexThreadRecord): string {
+  const storedTitle = cleanProviderSessionTitle(thread.title || "");
+  const firstMessage = cleanProviderSessionTitle(thread.firstUserMessage || "");
+  const storedSeed = storedTitle.replace(/(?:\.{3}|…)$/u, "").trim().toLowerCase();
+  const firstMessageLower = firstMessage.toLowerCase();
+  const storedLooksAutomatic = !storedTitle ||
+    storedTitle === "(untitled)" ||
+    storedTitle.toLowerCase() === firstMessageLower ||
+    (storedSeed.length >= 12 && firstMessageLower.startsWith(storedSeed));
+  if (!storedLooksAutomatic) {
+    return storedTitle;
+  }
+  return deriveSessionTitle(firstMessage || storedTitle) || "Codex thread";
 }
 
 function shouldReplaceSessionDisplayName(
@@ -8797,7 +8928,7 @@ function formatSelectedProviderSessionLabel(picks: ProviderSessionPick[], select
   if (!selected) {
     return "current session";
   }
-  return `${formatProviderDisplayName(selected.provider)}, ${trimLine(selected.title, 70)}`;
+  return `#${picks.indexOf(selected) + 1}, ${formatProviderDisplayName(selected.provider)}`;
 }
 
 function formatUnifiedSessionLine(index: number, session: AgentSessionRecord, selectedSessionId?: string): string {
@@ -8812,7 +8943,7 @@ function formatProviderSessionPickLine(index: number, pick: ProviderSessionPick,
   const selected = providerSessionPickAgentId(pick) === selectedSessionId ? ", selected" : "";
   const running = pick.status === "running" ? ", running" : "";
   const old = pick.kind === "agent" ? "" : ", old";
-  const title = trimLine(pick.title || "(untitled)", 115);
+  const title = trimLine(pick.title || "(untitled)", 82);
   const workspace = getWorkspaceShortName(pick.workspace);
   return `${index}. ${formatProviderDisplayName(pick.provider)}${selected}${running}${old}, ${formatRelativeTime(new Date(pick.updatedAt))}, ${workspace}: ${title}`;
 }
@@ -8846,7 +8977,7 @@ function formatProviderDisplayName(provider: AgentProviderKind): string {
 }
 
 export function provisionalClaudeTitle(promptText: string): string {
-  const cleaned = cleanProviderSessionTitle(promptText);
+  const cleaned = deriveSessionTitle(cleanProviderSessionTitle(promptText));
   return isUsefulClaudeSessionTitle(cleaned) ? trimLine(cleaned, 160) : "";
 }
 
@@ -8923,8 +9054,11 @@ function readClaudeTranscriptSummary(file: { path: string; sessionId: string; up
   }
 
   let workspace = "";
-  let title = "";
+  let explicitTitle = "";
+  let fallbackTitle = "";
+  let inspectedLines = 0;
   for (const line of text.split(/\r?\n/)) {
+    inspectedLines += 1;
     if (!line.trim()) {
       continue;
     }
@@ -8935,31 +9069,40 @@ function readClaudeTranscriptSummary(file: { path: string; sessionId: string; up
       continue;
     }
 
-    if (!workspace && typeof entry.cwd === "string") {
+    if (typeof entry.cwd === "string" && entry.cwd.trim()) {
       workspace = entry.cwd;
     }
 
     if (entry.type === "ai-title" && typeof entry.aiTitle === "string" && entry.aiTitle.trim()) {
-      title = cleanProviderSessionTitle(entry.aiTitle);
+      explicitTitle = cleanProviderSessionTitle(entry.aiTitle);
     }
 
-    if (!title && entry.type === "user") {
-      const rawCandidate = extractClaudeUserText(entry);
-      const candidate = cleanProviderSessionTitle(rawCandidate);
-      if (isUsefulClaudeSessionTitle(candidate, rawCandidate)) {
-        title = candidate;
+    if (entry.type === "custom-title" && typeof entry.customTitle === "string") {
+      const candidate = cleanProviderSessionTitle(entry.customTitle);
+      if (!isGenericClaudeTranscriptTitle(candidate)) {
+        explicitTitle = candidate;
       }
     }
 
-    if (workspace && title) {
+    if (!fallbackTitle && entry.type === "user") {
+      const rawCandidate = extractClaudeUserText(entry);
+      const candidate = deriveSessionTitle(cleanProviderSessionTitle(rawCandidate));
+      if (isUsefulClaudeSessionTitle(candidate, rawCandidate)) {
+        fallbackTitle = candidate;
+      }
+    }
+
+    if (workspace && (explicitTitle || fallbackTitle) && inspectedLines >= 200) {
       break;
     }
   }
 
+  const resolvedFallbackTitle = resolveClaudeTranscriptFallbackTitle(fallbackTitle, workspace);
+
   return {
     sessionId: file.sessionId,
     workspace: workspace || path.dirname(file.path),
-    title: title || `Claude session ${file.sessionId.slice(0, 8)}`,
+    title: explicitTitle || resolvedFallbackTitle || `Claude session ${file.sessionId.slice(0, 8)}`,
     updatedAt: file.updatedAt,
   };
 }
@@ -9011,6 +9154,26 @@ export function isUsefulClaudeSessionTitle(text: string, rawText = text): boolea
   return !/^(?:hi|hello|hey|yes|no|ok|okay|continue|go ahead)[.!?]*$/iu.test(text);
 }
 
+export function resolveClaudeTranscriptFallbackTitle(candidate: string, workspace: string): string {
+  const cleanedCandidate = cleanProviderSessionTitle(candidate);
+  const folder = path.basename(workspace.trim()).replace(/[-_]+/gu, " ").replace(/\s+/gu, " ").trim();
+  const genericFolder = /^(?:codetest|code|project|repo|repository|workspace|src|source|home|temp|tmp)$/iu.test(folder);
+  const opaqueFolder = !/[a-z]/iu.test(folder) || looksLikeUuid(folder) || folder.startsWith(".");
+  if (!folder || genericFolder || opaqueFolder) {
+    return cleanedCandidate === "(untitled)" ? "" : cleanedCandidate;
+  }
+
+  const weakCandidate = !cleanedCandidate ||
+    cleanedCandidate === "(untitled)" ||
+    /^[a-z]/u.test(cleanedCandidate) ||
+    /^(?:another|doing|it|looking|something|that|thinking|this|trying|working)\b/iu.test(cleanedCandidate);
+  if (!weakCandidate) {
+    return cleanedCandidate;
+  }
+
+  return `${folder[0]?.toUpperCase() ?? ""}${folder.slice(1)}`;
+}
+
 function shouldPreferClaudeTranscriptTitle(current: string | undefined, transcriptTitle: string): boolean {
   if (!isUsefulClaudeSessionTitle(transcriptTitle)) {
     return false;
@@ -9018,7 +9181,13 @@ function shouldPreferClaudeTranscriptTitle(current: string | undefined, transcri
   const cleanedCurrent = cleanProviderSessionTitle(current || "");
   return !isUsefulClaudeSessionTitle(cleanedCurrent) ||
     cleanedCurrent.toLowerCase() === "claude code" ||
-    cleanedCurrent.toLowerCase().startsWith("telecode ");
+    cleanedCurrent.toLowerCase().startsWith("telecode ") ||
+    cleanedCurrent.length > 82 ||
+    deriveSessionTitle(cleanedCurrent).toLowerCase() === transcriptTitle.toLowerCase();
+}
+
+function isGenericClaudeTranscriptTitle(title: string): boolean {
+  return /^(?:telecode|telecodex)(?:\s+\S+)?$/i.test(title) || title.toLowerCase() === "claude code";
 }
 
 function cleanProviderSessionTitle(title: string): string {

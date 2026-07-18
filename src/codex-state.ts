@@ -1,6 +1,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { isCodexReasoningEffort, type CodexReasoningEffort } from "./reasoning-effort.js";
+
 export interface CodexThreadRecord {
   id: string;
   title: string;
@@ -14,6 +16,7 @@ export interface CodexThreadRecord {
 export interface CodexModelRecord {
   slug: string;
   displayName: string;
+  supportedReasoningEfforts?: CodexReasoningEffort[];
 }
 
 export interface CodexHistoryMessage {
@@ -109,6 +112,7 @@ export function findLatestDatabase(): string | null {
 
 export function listThreads(limit = 20): CodexThreadRecord[] {
   return withDatabase((db) => {
+    const spawnedThreadIds = new Set(readSpawnedThreadIds(db));
     const query = db.prepare(`
       SELECT id, title, cwd, model, created_at, updated_at, first_user_message
       FROM threads
@@ -117,8 +121,11 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
       LIMIT ?
     `);
 
-    const rows = query.all(limit) as ThreadRow[];
-    return rows.map(mapThreadRow);
+    const rows = query.all(limit + spawnedThreadIds.size) as ThreadRow[];
+    return rows
+      .filter((row) => !spawnedThreadIds.has(String(row.id ?? "")))
+      .slice(0, limit)
+      .map(mapThreadRow);
   }) ?? [];
 }
 
@@ -158,6 +165,27 @@ export function getThreadByPrefix(idPrefix: string): CodexThreadRecord | null {
       return rows.length === 1 ? mapThreadRow(rows[0]!) : null;
     }) ?? null
   );
+}
+
+export function listSpawnedThreadIds(): string[] {
+  return withDatabase(readSpawnedThreadIds) ?? [];
+}
+
+function readSpawnedThreadIds(db: DatabaseInstance): string[] {
+  try {
+    const query = db.prepare(`
+      SELECT DISTINCT child_thread_id
+      FROM thread_spawn_edges
+      WHERE child_thread_id IS NOT NULL AND child_thread_id != ''
+    `);
+    return (query.all() as Array<{ child_thread_id?: unknown }>)
+      .map((row) => typeof row.child_thread_id === "string" ? row.child_thread_id : "")
+      .filter(Boolean);
+  } catch {
+    // Older Codex databases predate the spawn-edge table. Their threads are all
+    // top-level, so session browsing must continue to work without this metadata.
+    return [];
+  }
 }
 
 export function listChildThreads(parentThreadId: string): CodexChildThreadRecord[] {
@@ -275,7 +303,12 @@ export function listModels(): CodexModelRecord[] {
 
   try {
     const payload = JSON.parse(readFileSync(modelsPath, "utf8")) as {
-      models?: Array<{ slug?: unknown; display_name?: unknown; visibility?: unknown }>;
+      models?: Array<{
+        slug?: unknown;
+        display_name?: unknown;
+        visibility?: unknown;
+        supported_reasoning_levels?: Array<{ effort?: unknown }>;
+      }>;
     };
 
     const models = (payload.models ?? [])
@@ -284,6 +317,9 @@ export function listModels(): CodexModelRecord[] {
       .map((model) => ({
         slug: typeof model.slug === "string" ? model.slug : "",
         displayName: typeof model.display_name === "string" ? model.display_name : "",
+        supportedReasoningEfforts: (model.supported_reasoning_levels ?? [])
+          .map((level) => level?.effort)
+          .filter(isCodexReasoningEffort),
       }))
       .filter((model) => model.slug && model.displayName);
 

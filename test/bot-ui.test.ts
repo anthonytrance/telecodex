@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   cleanSessionTitle,
+  deriveSessionTitle,
   formatSessionLabel,
   renderHelpMessage,
   renderWelcomeFirstTime,
@@ -98,7 +99,7 @@ describe("bot-ui", () => {
         relativeTime: "1m ago",
         isActive: false,
       });
-      expect(label).toContain("I would like you");
+      expect(label).toContain("Help me install");
       expect(label).not.toContain("Output files");
     });
 
@@ -215,6 +216,28 @@ describe("bot-ui", () => {
           ].join("\n"),
         ),
       ).toBe("Continue TeleCode app-server progress cleanup.");
+    });
+  });
+
+  describe("deriveSessionTitle", () => {
+    it("turns the weather session prompt into a concise topic", () => {
+      const title = deriveSessionTitle(
+        "Hello there, I actually made a cloud worker account and I’m working on the weather app that gives me detailed observations from the area that I’m in in the world, and I want to improve it.",
+      );
+
+      expect(title).toBe("Weather app with detailed local observations");
+    });
+
+    it("removes conversational problem framing", () => {
+      const title = deriveSessionTitle(
+        "There’s another problem with the code at the moment, which is that the session command doesn’t appear to list all sessions anymore and it includes subagents.",
+      );
+
+      expect(title).toBe("Session command doesn’t appear to list all sessions anymore");
+    });
+
+    it("keeps explicit short titles intact", () => {
+      expect(deriveSessionTitle("Weather session accessibility pass")).toBe("Weather session accessibility pass");
     });
   });
 });

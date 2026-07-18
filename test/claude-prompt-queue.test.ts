@@ -71,6 +71,15 @@ describe("ClaudePromptQueue", () => {
     expect(queue.dequeue("lane-1")).toBeUndefined();
     expect(queue.dequeue("lane-2")?.text).toBe("other lane");
   });
+
+  it("persists delivery failure counts used to cap automatic retries", () => {
+    const queue = new ClaudePromptQueue(queuePath);
+    queue.enqueue({ ...entry("a", "lane-1", "retry me"), deliveryFailures: 2 });
+
+    const reloaded = new ClaudePromptQueue(queuePath);
+
+    expect(reloaded.dequeue("lane-1")?.deliveryFailures).toBe(2);
+  });
 });
 
 function entry(id: string, contextKey: string, text: string): ClaudePromptQueueEntry {

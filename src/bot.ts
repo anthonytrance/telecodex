@@ -2662,6 +2662,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     let agentJobId: string | undefined;
     let completedSuccessfully = false;
     let deferQueuedDispatch = false;
+    let sawAssistantCompletion = false;
+    let providerTurnError: string | undefined;
 
     const bufferClaudeOutput = (
       kind: BufferedOutputEvent["kind"],
@@ -2890,6 +2892,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           }
           case "assistant_message_complete":
             clearNarrationIdleTimer();
+            sawAssistantCompletion = true;
             finalText = event.text.trim() || streamedText.trim() || pendingAssistantProgressText.trim();
             finalAssistantBlock = pendingAssistantProgressText.trim() || remainingCompletionText(finalText, streamedText);
             pendingAssistantProgressText = "";
@@ -2933,17 +2936,19 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             // B1 invariant: a held narration block must not be lost when the turn
             // errors mid-way; flush it as progress before reporting the failure.
             await flushPendingClaudeAssistantProgress();
-            const message = `Claude error: ${event.message}`;
-            if (isProviderForeground(contextKey, "claude")) {
-              await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
-            } else {
-              bufferClaudeOutput("error", message, true);
-            }
+            providerTurnError ??= event.message;
             break;
           }
           default:
             break;
         }
+      }
+
+      if (providerTurnError) {
+        throw new Error(providerTurnError);
+      }
+      if (!sawAssistantCompletion) {
+        throw new Error("Claude provider ended the turn without a completion event.");
       }
 
       // Claude reveals its real session id only once the first turn runs (it ignores the

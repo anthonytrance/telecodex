@@ -32,6 +32,8 @@ export interface ClaudeSdkTurnOptions {
   onProviderSessionId?: (providerSessionId: string) => void;
   /** Optional controller for live steering after promptText starts the turn. */
   inputController?: ClaudeSdkInputController;
+  /** Emit a visible status when the SDK has produced no events for this long. */
+  quietStatusIntervalMs?: number;
   /** Injectable for tests; defaults to the real SDK query(). */
   queryFn?: (input: {
     prompt: string | AsyncIterable<SdkUserMessageLike>;
@@ -73,6 +75,12 @@ export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLik
   private readonly queue: SdkUserMessageLike[] = [];
   private readonly waiters: Array<(result: IteratorResult<SdkUserMessageLike>) => void> = [];
   private closed = false;
+  private deliveredMessageCount = 0;
+
+  /** Number of live inputs already handed to the SDK stream consumer. */
+  get deliveredCount(): number {
+    return this.deliveredMessageCount;
+  }
 
   push(text: string, priority: SdkUserMessageLike["priority"] = "now"): void {
     const trimmed = text.trim();
@@ -85,6 +93,7 @@ export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLik
     const message = sdkUserMessage(trimmed, priority);
     const waiter = this.waiters.shift();
     if (waiter) {
+      this.deliveredMessageCount += 1;
       waiter({ value: message, done: false });
     } else {
       this.queue.push(message);
@@ -106,6 +115,7 @@ export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLik
       next: async (): Promise<IteratorResult<SdkUserMessageLike>> => {
         const next = this.queue.shift();
         if (next) {
+          this.deliveredMessageCount += 1;
           return { value: next, done: false };
         }
         if (this.closed) {
@@ -157,22 +167,38 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         ...(activeProviderSessionId ? { resume: activeProviderSessionId } : {}),
         ...(attempt > 0 ? { forkSession: false } : {}),
       };
-      // Always send the turn's initial request as the primary SDK prompt. Using the
-      // AsyncIterable as the primary prompt can let a pending task notification finish
-      // the resumed query before the queued user message is consumed. Reserve the
-      // streaming input channel for genuine mid-turn steering instead.
-      const query = queryFn({ prompt: retryPrompt, options: sdkOptions });
-      const steerStream = attempt === 0 && inputController && query.streamInput
-        ? query.streamInput(inputController).catch((error: unknown) => {
-            bridgeLog("error", `sdk live input stream failed: ${error instanceof Error ? error.message : String(error)}`);
-          })
-        : undefined;
+      // A string prompt makes Anthropic's Query a single-user-turn query. The SDK then
+      // closes CLI stdin on the FIRST result, including the empty interrupted result
+      // produced by a priority-now steer. Keep the initial prompt and all live steers in
+      // one primary AsyncIterable so the SDK leaves stdin open for the continuation.
+      // The initial message is yielded before the controller is read, so it cannot be
+      // overtaken by a live steer or a pending provider notification.
+      const sdkPrompt = attempt === 0 && inputController
+        ? initialPromptAndLiveInput(retryPrompt, inputController)
+        : retryPrompt;
+      const query = queryFn({ prompt: sdkPrompt, options: sdkOptions });
       let sawResult = false;
-      let sawAssistantText = false;
+      let sawTerminalResult = false;
+      let finalAssistantText = "";
+      let finalAssistantTextSteerCount = inputController?.deliveredCount ?? 0;
+      let handledSteerCount = 0;
       let retryEmptySuccess = false;
 
       try {
-        for await (const message of query) {
+        for await (const item of sdkMessagesWithQuietStatus(
+          query,
+          options.quietStatusIntervalMs ?? 180_000,
+        )) {
+          if (item.kind === "quiet") {
+            yield {
+              type: "status_message",
+              sessionId,
+              jobId,
+              text: formatSdkQuietWarning(item.quietForMs),
+            };
+            continue;
+          }
+          const message = item.message;
           if (message.type === "system" && message.subtype === "init") {
             if (message.session_id) {
               activeProviderSessionId = message.session_id;
@@ -182,6 +208,13 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
           }
 
           if (message.type === "assistant") {
+            const deliveredSteerCount = inputController?.deliveredCount ?? 0;
+            if (deliveredSteerCount !== finalAssistantTextSteerCount) {
+              // Text emitted before a priority-now steer belongs to the interrupted
+              // response, not to the answer Claude still owes for the steer.
+              finalAssistantText = "";
+              finalAssistantTextSteerCount = deliveredSteerCount;
+            }
             const model = message.message?.model;
             if (model && model !== "<synthetic>" && model !== lastModel) {
               lastModel = model;
@@ -190,9 +223,13 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
             for (const block of message.message?.content ?? []) {
               const blockType = typeof block.type === "string" ? block.type : "";
               if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
-                sawAssistantText = true;
+                finalAssistantText += `${finalAssistantText ? "\n\n" : ""}${block.text.trim()}`;
                 yield { type: "assistant_text_delta", sessionId, jobId, text: block.text };
               } else if (blockType === "tool_use") {
+                // Narration before a tool call is progress. Only text after the final
+                // tool call can stand in for an SDK result whose result field is empty.
+                finalAssistantText = "";
+                finalAssistantTextSteerCount = deliveredSteerCount;
                 yield {
                   type: "tool_started",
                   sessionId,
@@ -231,15 +268,34 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
 
             if (message.subtype === "success") {
               const resultText = (message.result ?? "").trim();
-              if (resultText || sawAssistantText) {
+              const deliveredSteerCount = inputController?.deliveredCount ?? 0;
+              if (deliveredSteerCount !== finalAssistantTextSteerCount) {
+                finalAssistantText = "";
+                finalAssistantTextSteerCount = deliveredSteerCount;
+              }
+              const completionText = resultText || finalAssistantText.trim();
+              if (completionText) {
                 yield {
                   type: "assistant_message_complete",
                   sessionId,
                   jobId,
-                  text: resultText,
+                  text: completionText,
                 };
+                sawTerminalResult = true;
+              } else if (deliveredSteerCount > handledSteerCount) {
+                // A priority-now steer interrupts Claude's current response. The SDK
+                // reports that interrupted response as an empty successful result, then
+                // continues the SAME query with the steered response. Do not close the
+                // query on this intermediate result.
+                handledSteerCount = deliveredSteerCount;
+                bridgeLog(
+                  "steer",
+                  `sdk received empty interrupted result; awaiting steered continuation session=${activeProviderSessionId ?? sessionId}`,
+                );
+                continue;
               } else if (attempt === 0) {
                 retryEmptySuccess = true;
+                sawTerminalResult = true;
                 bridgeLog("retry", `sdk turn returned empty success; retrying session=${activeProviderSessionId ?? sessionId}`);
               } else {
                 yield {
@@ -248,11 +304,13 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
                   jobId,
                   message: "Claude SDK returned a successful result without assistant text twice.",
                 };
+                sawTerminalResult = true;
               }
             } else {
               const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
               bridgeLog("error", `sdk turn result ${message.subtype ?? "?"}: ${detail}`);
               yield { type: "error", sessionId, jobId, message: `Claude SDK turn ended: ${detail}` };
+              sawTerminalResult = true;
             }
             break;
           }
@@ -265,7 +323,6 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
           inputController?.close();
         }
         query.close?.();
-        await steerStream;
       }
 
       if (!sawResult) {
@@ -277,6 +334,26 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         };
         return;
       }
+      if (!sawTerminalResult) {
+        // The transport ended after the empty result that interrupted a live steer,
+        // before it produced the continuation. Retry through resume instead of
+        // silently accepting the interrupted response as a completed turn.
+        if (attempt === 0) {
+          retryEmptySuccess = true;
+          bridgeLog(
+            "retry",
+            `sdk stream ended before steered continuation; retrying session=${activeProviderSessionId ?? sessionId}`,
+          );
+        } else {
+          yield {
+            type: "error",
+            sessionId,
+            jobId,
+            message: "Claude SDK ended before producing a response to the live steer.",
+          };
+          return;
+        }
+      }
       if (!retryEmptySuccess) {
         return;
       }
@@ -286,12 +363,84 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   }
 }
 
+async function* initialPromptAndLiveInput(
+  promptText: string,
+  inputController: ClaudeSdkInputController,
+): AsyncIterable<SdkUserMessageLike> {
+  yield sdkUserMessage(promptText);
+  for await (const message of inputController) {
+    yield message;
+  }
+}
+
+type SdkMessageWaitResult =
+  | { kind: "message"; message: SdkMessageLike }
+  | { kind: "quiet"; quietForMs: number };
+
+async function* sdkMessagesWithQuietStatus(
+  messages: AsyncIterable<SdkMessageLike>,
+  quietStatusIntervalMs: number,
+): AsyncIterable<SdkMessageWaitResult> {
+  const intervalMs = Math.max(1, quietStatusIntervalMs);
+  const iterator = messages[Symbol.asyncIterator]();
+  let nextMessage = iterator.next();
+  let lastMessageAt = Date.now();
+
+  while (true) {
+    const outcome = await waitForSdkMessage(nextMessage, intervalMs);
+    if (outcome.kind === "quiet") {
+      yield { kind: "quiet", quietForMs: Date.now() - lastMessageAt };
+      continue;
+    }
+    if (outcome.result.done) {
+      return;
+    }
+    lastMessageAt = Date.now();
+    yield { kind: "message", message: outcome.result.value };
+    nextMessage = iterator.next();
+  }
+}
+
+async function waitForSdkMessage(
+  nextMessage: Promise<IteratorResult<SdkMessageLike>>,
+  timeoutMs: number,
+): Promise<
+  | { kind: "message"; result: IteratorResult<SdkMessageLike> }
+  | { kind: "quiet" }
+> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      nextMessage.then((result) => ({ kind: "message" as const, result })),
+      new Promise<{ kind: "quiet" }>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "quiet" }), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function formatSdkQuietWarning(milliseconds: number): string {
+  const duration = milliseconds < 60_000
+    ? `${Math.max(1, Math.round(milliseconds / 1000))} ${milliseconds < 1_500 ? "second" : "seconds"}`
+    : `${Math.max(1, Math.round(milliseconds / 60_000))} ${milliseconds < 90_000 ? "minute" : "minutes"}`;
+  return [
+    `Claude has been quiet for ${duration}.`,
+    "It may still be working. Send /stop to stop it.",
+    "If you do nothing, I will keep waiting.",
+  ].join(" ");
+}
+
 async function loadSdkQuery(): Promise<NonNullable<ClaudeSdkTurnOptions["queryFn"]>> {
   const sdk = await import("@anthropic-ai/claude-agent-sdk");
   return sdk.query as unknown as NonNullable<ClaudeSdkTurnOptions["queryFn"]>;
 }
 
-function sdkUserMessage(text: string, priority: SdkUserMessageLike["priority"]): SdkUserMessageLike {
+function sdkUserMessage(text: string, priority?: SdkUserMessageLike["priority"]): SdkUserMessageLike {
   return {
     type: "user",
     message: {
@@ -299,7 +448,7 @@ function sdkUserMessage(text: string, priority: SdkUserMessageLike["priority"]):
       content: [{ type: "text", text }],
     },
     parent_tool_use_id: null,
-    priority,
+    ...(priority ? { priority } : {}),
     shouldQuery: true,
     timestamp: new Date().toISOString(),
   };

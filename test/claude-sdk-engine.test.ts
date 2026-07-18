@@ -124,7 +124,7 @@ describe("claude sdk engine", () => {
     expect(seen[0]!.options.forkSession).toBe(true);
   });
 
-  it("sends the initial prompt directly and reserves streaming input for live steering", async () => {
+  it("uses one primary multi-turn input stream for the initial prompt and live steering", async () => {
     const inputController = new ClaudeSdkInputController();
     const streamedPrompts: SdkUserMessageLike[] = [];
     const seenPrompts: Array<string | AsyncIterable<SdkUserMessageLike>> = [];
@@ -137,20 +137,26 @@ describe("claude sdk engine", () => {
       const gotSteer = new Promise<void>((resolve) => {
         gotSteerResolve = resolve;
       });
+      const consumeInput = (async () => {
+        if (typeof input.prompt === "string") {
+          return;
+        }
+        for await (const message of input.prompt) {
+          streamedPrompts.push(message);
+          if (streamedPrompts.length >= 2) {
+            gotSteerResolve?.();
+            return;
+          }
+        }
+      })();
+      // Keep the emulated SDK input consumer alive and make close harmless.
       const query = (async function* () {
         yield { type: "system", subtype: "init", session_id: "s" } satisfies SdkMessageLike;
         await gotSteer;
         yield { type: "result", subtype: "success", result: "ok", usage: {} } satisfies SdkMessageLike;
-      })() as AsyncGenerator<SdkMessageLike> & {
-        streamInput: (stream: AsyncIterable<SdkUserMessageLike>) => Promise<void>;
-      };
-      query.streamInput = async (stream) => {
-        for await (const message of stream) {
-          streamedPrompts.push(message);
-          gotSteerResolve?.();
-          return;
-        }
-      };
+        await consumeInput;
+      })() as AsyncGenerator<SdkMessageLike> & { close: () => void };
+      query.close = () => {};
       return query;
     };
 
@@ -159,12 +165,101 @@ describe("claude sdk engine", () => {
     inputController.push("steer this turn", "now");
     const events = await eventsPromise;
 
-    expect(seenPrompts).toEqual([baseOptions.promptText]);
+    expect(seenPrompts).toHaveLength(1);
+    expect(typeof seenPrompts[0]).not.toBe("string");
     expect(streamedPrompts.map((message) => message.message.content[0]?.text)).toEqual([
+      baseOptions.promptText,
       "steer this turn",
     ]);
-    expect(streamedPrompts[0]?.priority).toBe("now");
+    expect(streamedPrompts[0]?.priority).toBeUndefined();
+    expect(streamedPrompts[1]?.priority).toBe("now");
     expect(events.some((event) => event.type === "assistant_message_complete")).toBe(true);
+  });
+
+  it("keeps the SDK query open for the continuation after a priority-now steer interrupts the first result", async () => {
+    const inputController = new ClaudeSdkInputController();
+    let releaseAfterSteer: (() => void) | undefined;
+    let waitingForSteer = false;
+    const afterSteer = new Promise<void>((resolve) => {
+      releaseAfterSteer = resolve;
+    });
+    let queryCalls = 0;
+    const queryFn = (input: {
+      prompt: string | AsyncIterable<SdkUserMessageLike>;
+      options: Record<string, unknown>;
+    }) => {
+      queryCalls += 1;
+      void (async () => {
+        if (typeof input.prompt === "string") {
+          return;
+        }
+        let messageCount = 0;
+        for await (const message of input.prompt) {
+          messageCount += 1;
+          if (messageCount === 2 && message.message.content[0]?.text === "new direction") {
+            releaseAfterSteer?.();
+            return;
+          }
+        }
+      })();
+      const query = (async function* () {
+        yield { type: "system", subtype: "init", session_id: "steered-session" } satisfies SdkMessageLike;
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "Progress before steer" }] },
+        } satisfies SdkMessageLike;
+        waitingForSteer = true;
+        await afterSteer;
+        // Claude emits this for the response interrupted by priority: now. It is
+        // not the end of the SDK query and must not close the streaming input.
+        yield { type: "result", subtype: "success", result: "", usage: {} } satisfies SdkMessageLike;
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "STEERED_FINAL" }] },
+        } satisfies SdkMessageLike;
+        yield { type: "result", subtype: "success", result: "STEERED_FINAL", usage: {} } satisfies SdkMessageLike;
+      })();
+      return query;
+    };
+
+    const eventsPromise = collect(runClaudeSdkTurn({
+      ...baseOptions,
+      inputController,
+      queryFn,
+    }));
+    await waitUntil(() => queryCalls === 1 && waitingForSteer);
+    inputController.push("new direction", "now");
+    const events = await eventsPromise;
+
+    expect(queryCalls).toBe(1);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "assistant_message_complete",
+      text: "STEERED_FINAL",
+    }));
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
+  it("emits quiet status while an SDK query is still waiting", async () => {
+    const queryFn = () => (async function* () {
+      yield { type: "system", subtype: "init", session_id: "quiet-session" } satisfies SdkMessageLike;
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      yield { type: "result", subtype: "success", result: "done", usage: {} } satisfies SdkMessageLike;
+    })();
+
+    const events = await collect(runClaudeSdkTurn({
+      ...baseOptions,
+      quietStatusIntervalMs: 10,
+      queryFn,
+    }));
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "status_message",
+      text: expect.stringMatching(/^Claude has been quiet for /u),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "assistant_message_complete",
+      text: "done",
+    }));
   });
 
   it("retries an empty successful result once and resumes the real session id", async () => {
@@ -200,7 +295,14 @@ describe("claude sdk engine", () => {
     }));
 
     expect(calls).toHaveLength(2);
-    expect(calls[0]?.prompt).toBe(baseOptions.promptText);
+    expect(typeof calls[0]?.prompt).not.toBe("string");
+    const firstAttemptPrompts: string[] = [];
+    if (typeof calls[0]?.prompt !== "string") {
+      for await (const message of calls[0]!.prompt) {
+        firstAttemptPrompts.push(message.message.content[0]?.text ?? "");
+      }
+    }
+    expect(firstAttemptPrompts[0]).toBe(baseOptions.promptText);
     expect(calls[1]?.options.resume).toBe("real-resumed-session");
     expect(calls[1]?.prompt).toEqual(expect.stringContaining("previous turn ended successfully"));
     expect(events.some((event) => event.type === "status_message")).toBe(false);

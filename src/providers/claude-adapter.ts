@@ -466,6 +466,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         forkSession: Boolean(runtime.forkSourceSessionId),
         abortController,
         inputController,
+        quietStatusIntervalMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
         onProviderSessionId: (providerSessionId) => {
           runtime.forkSourceSessionId = undefined;
           if (runtime.descriptor.metadata?.forkSourceSessionId) {

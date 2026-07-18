@@ -689,10 +689,10 @@ describe("Claude bot flow", () => {
   });
 
   it("disposes the previous integrated Claude runtime when /new claude replaces it", async () => {
-    const { bot } = await createTestBot(tempDir);
+    const { bot, sent } = await createTestBot(tempDir);
 
     await bot.handleUpdate(textUpdate(1, "/claude first"));
-    await waitFor(() => mockClaude.prompts.includes("first"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to first")));
     await bot.handleUpdate(textUpdate(2, "/new claude"));
 
     expect(mockClaude.createSession).toHaveBeenCalledTimes(2);
@@ -781,6 +781,21 @@ describe("Claude bot flow", () => {
     expect(texts.filter((text) => text.includes("PART_ONE"))).toHaveLength(1);
     expect(texts.filter((text) => text.includes("PART_TWO"))).toHaveLength(1);
     expect(texts.filter((text) => text.includes("boom mid-turn"))).toHaveLength(1);
+    expect(texts.some((text) => text.includes("Claude failed: boom mid-turn"))).toBe(true);
+  });
+
+  it("reports a provider stream that ends without a completion instead of marking it successful", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setNextEvents([
+      { type: "status_message", sessionId: "claude-provider-1", jobId: "job-1", text: "Still working." },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude incomplete"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("without a completion event")), 3000);
+
+    const texts = sent.map((entry) => entry.text ?? "");
+    expect(texts.some((text) => text.includes("Claude failed:"))).toBe(true);
+    expect(texts.some((text) => text.includes("Claude finished without text"))).toBe(false);
   });
 
   it("delivers narration in full in edit mode, rolling oversized blocks into their own messages", async () => {

@@ -37,6 +37,7 @@ try {
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
   await registerCommands(bot);
+  bot.startSessionSearchIndexing();
 
   console.log("TeleCode running");
   console.log(

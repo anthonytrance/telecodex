@@ -205,7 +205,7 @@ describe("AppServerSessionService", () => {
       model: "gpt-test",
       effort: "max",
       input: [
-        { type: "text", text: "read file\n\nhello", text_elements: [] },
+        { type: "text", text: "hello\n\nread file", text_elements: [] },
         { type: "localImage", path: "/tmp/image.png" },
       ],
     });

@@ -375,6 +375,12 @@ function getCodexDir(): string | null {
   return home ? path.join(home, ".codex") : null;
 }
 
+/** Root of the on-disk Codex rollout files, one jsonl per thread. */
+export function getCodexSessionsDirPath(): string | null {
+  const codexDir = getCodexDir();
+  return codexDir ? path.join(codexDir, "sessions") : null;
+}
+
 function getModelsCachePath(): string | null {
   const codexDir = getCodexDir();
   return codexDir ? path.join(codexDir, "models_cache.json") : null;

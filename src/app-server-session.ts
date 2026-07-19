@@ -1128,7 +1128,9 @@ export class AppServerSessionService {
     }
 
     const result: JsonValue[] = [];
-    const textParts = [input.stagedFileInstructions, input.text].filter(
+    // User text first: Codex titles threads from the start of the first message,
+    // so the staged-file/output instructions must not lead the prompt.
+    const textParts = [input.text, input.stagedFileInstructions].filter(
       (value): value is string => typeof value === "string" && value.length > 0,
     );
     if (textParts.length > 0) {

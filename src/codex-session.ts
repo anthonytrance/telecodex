@@ -502,11 +502,13 @@ export class CodexSessionService {
     const parts: UserInput[] = [];
     const textParts: string[] = [];
 
-    if (input.stagedFileInstructions) {
-      textParts.push(input.stagedFileInstructions);
-    }
+    // User text first: Codex titles threads from the start of the first message,
+    // so the staged-file/output instructions must not lead the prompt.
     if (input.text) {
       textParts.push(input.text);
+    }
+    if (input.stagedFileInstructions) {
+      textParts.push(input.stagedFileInstructions);
     }
     if (textParts.length > 0) {
       parts.push({ type: "text", text: textParts.join("\n\n") });

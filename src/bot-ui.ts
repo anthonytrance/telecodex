@@ -50,6 +50,7 @@ export function renderHelpMessage(): DualText {
         ["/appbackendtest", "Smoke-test app-server backend"],
         ["/artifacttest", "Send a generated test file"],
         ["/sessions", "Browse & switch threads"],
+        ["/find <words>", "Search all sessions by content (/search alias)"],
         ["/replay [n|all]", "Release buffered background commentary"],
         ["/use <number>", "Switch after /sessions"],
         ["/use previous", "Switch to previous thread"],

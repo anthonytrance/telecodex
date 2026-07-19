@@ -26,6 +26,7 @@ import {
   cleanupInbox,
   outboxPath,
   outputFilesInstruction,
+  OUTPUT_FILES_INSTRUCTION_PREFIX,
   stageFile,
   stripOutputFilesInstruction,
   type StagedFile,
@@ -60,6 +61,7 @@ import {
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
 import {
+  getCodexSessionsDirPath,
   getParentThread,
   getThread,
   getThreadByPrefix,
@@ -92,6 +94,7 @@ import {
 } from "./providers/claude-state.js";
 import { findTranscript } from "./providers/claude-transcript.js";
 import type { AgentProviderEvent, AgentProviderKind, AgentSessionDescriptor } from "./providers/types.js";
+import { createSessionSearchIndex, type SessionSearchHit } from "./session-search.js";
 import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
 import { mergeLiveAppServerRateLimits, readLatestCodexUsage, renderUsagePlain } from "./usage.js";
@@ -164,6 +167,8 @@ const TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "sessions",
   "switch",
   "use",
+  "find",
+  "search",
   "replay",
   "copy",
   "last",
@@ -298,6 +303,8 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
 
 export interface TeleCodeBot extends Bot<Context> {
   disposeProviders(): Promise<void>;
+  /** Kick off the initial background build of the /find session search index. */
+  startSessionSearchIndexing(): void;
 }
 
 export function createBot(config: TeleCodeConfig, registry: SessionRegistry): TeleCodeBot {
@@ -360,6 +367,15 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     ? new ClaudeBackendPrefs(claudeBackendPrefsPath(config.workspace))
     : undefined;
   const claudeSessions = new Map<TelegramContextKey, AgentSessionDescriptor>();
+  const sessionSearch = createSessionSearchIndex({
+    indexPath: path.join(config.workspace, ".telecode", "session-index.sqlite"),
+    claudeProjectsDir: config.enableClaudeProvider
+      ? (config.claudeStrictMcpConfig
+        ? path.join(homedir(), ".claude", "projects")
+        : path.join(config.claudeConfigDir, "projects"))
+      : "",
+    codexSessionsDir: getCodexSessionsDirPath() ?? "",
+  });
 
   // The provider state is the authoritative pointer for the Claude conversation
   // attached to a Telegram lane. If transcript recovery ever corrected that pointer,
@@ -611,6 +627,25 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   };
 
   bot.disposeProviders = disposeProviderSessions;
+
+  // Deliberately not started from createBot: tests build bots without wanting a
+  // background crawl of the real transcript directories. index.ts triggers this
+  // once the bot is otherwise ready.
+  bot.startSessionSearchIndexing = () => {
+    if (!sessionSearch) {
+      return;
+    }
+    void sessionSearch.refresh()
+      .then(() => {
+        console.log(`Session search index ready (${sessionSearch.status().indexedFiles} sessions).`);
+      })
+      .catch((error) => {
+        console.warn(
+          "Initial session search index build failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+      });
+  };
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
@@ -5865,6 +5900,125 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     await selectUnifiedAgentSession(ctx, contextKeyForAgent, agentArg);
   });
 
+  const buildSearchResultPicks = (
+    hits: SessionSearchHit[],
+    limit: number,
+  ): Array<{ pick: ProviderSessionPick; snippet: string }> => {
+    const spawnedThreadIds = new Set(listSpawnedThreadIds());
+    const entries: Array<{ pick: ProviderSessionPick; snippet: string }> = [];
+    for (const hit of hits) {
+      if (entries.length >= limit) {
+        break;
+      }
+      if (hit.provider === "codex") {
+        if (spawnedThreadIds.has(hit.sessionId)) {
+          continue;
+        }
+        // Threads older than the current Codex state database no longer have a DB
+        // row; a record synthesized from the index still resumes from the rollout.
+        const thread = getThread(hit.sessionId) ?? {
+          id: hit.sessionId,
+          title: hit.title,
+          cwd: hit.workspace,
+          model: null,
+          createdAt: new Date(hit.updatedAt),
+          updatedAt: new Date(hit.updatedAt),
+          firstUserMessage: "",
+        };
+        const pick = providerSessionPickFromCodexThread(thread);
+        entries.push({
+          pick: hit.title ? { ...pick, title: cleanProviderSessionTitle(hit.title) } : pick,
+          snippet: hit.snippet,
+        });
+        continue;
+      }
+
+      if (!config.enableClaudeProvider) {
+        continue;
+      }
+      entries.push({
+        pick: providerSessionPickFromClaudeTranscript(
+          {
+            sessionId: hit.sessionId,
+            workspace: hit.workspace || config.workspace,
+            title: hit.title || `Claude session ${hit.sessionId.slice(0, 8)}`,
+            updatedAt: hit.updatedAt,
+          },
+          {
+            model: config.claudeDefaultModel,
+            permissionMode: config.claudePermissionMode,
+          },
+        ),
+        snippet: hit.snippet,
+      });
+    }
+    return entries;
+  };
+
+  bot.command(["find", "search"], async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!chatId || !contextKey) {
+      return;
+    }
+
+    const rawText = ctx.message?.text ?? "";
+    const query = rawText.replace(/^\/(?:find|search)(?:@\w+)?\s*/, "").trim();
+    if (!sessionSearch) {
+      const message = "Session search is unavailable because the better-sqlite3 module is not installed.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+    if (!query) {
+      const message = "Usage: /find <words>. Searches the full text of every Claude and Codex session, for example /find housing market. All words must appear in the same session.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    const status = sessionSearch.status();
+    if (!status.ready) {
+      void sessionSearch.refresh().catch(() => undefined);
+      const progress = status.refreshing && status.pendingFiles > 0
+        ? ` ${status.indexedFiles} sessions indexed, ${status.pendingFiles} still to go.`
+        : ` ${status.indexedFiles} sessions indexed so far.`;
+      const message = `The session search index is still building.${progress} Try /find again in a minute.`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    try {
+      await sessionSearch.refresh();
+    } catch {
+      // Search proceeds on the last good index when a refresh fails.
+    }
+
+    const result = sessionSearch.search(query, 30);
+    const entries = buildSearchResultPicks(result.hits, 10);
+    if (entries.length === 0) {
+      const message = `No sessions matched "${query}". Every word must appear in the same session; try fewer or different words.`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    pendingAgentSessionPicks.set(contextKey, entries.map((entry) => entry.pick));
+    const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
+    const shownNote = result.totalMatches > entries.length
+      ? `showing ${entries.length} of ${result.totalMatches}, newest first`
+      : "newest first";
+    const lines = [
+      `Sessions matching "${query}" (${shownNote}):`,
+      ...entries.flatMap((entry, index) => {
+        const line = formatProviderSessionPickLine(index + 1, entry.pick, selectedSessionId);
+        const snippet = trimLine(entry.snippet, 170);
+        return snippet ? [line, `Match: ${snippet}`] : [line];
+      }),
+      "",
+      "Use /switch 1 to open a result.",
+    ];
+    const plain = lines.join("\n");
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+  });
+
   bot.command("replay", async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     const chatId = ctx.chat?.id;
@@ -7525,6 +7679,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "appbackendtest", description: "Smoke-test app-server backend" },
     { command: "artifacttest", description: "Send a generated test file" },
     { command: "sessions", description: "Browse provider sessions" },
+    { command: "find", description: "Search all sessions by content" },
     { command: "replay", description: "Release buffered background commentary" },
     { command: "history", description: "Show recent local thread history" },
     { command: "children", description: "List child sessions" },
@@ -8826,8 +8981,14 @@ function resolveCodexThreadTitle(thread: CodexThreadRecord): string {
   const firstMessage = cleanProviderSessionTitle(thread.firstUserMessage || "");
   const storedSeed = storedTitle.replace(/(?:\.{3}|…)$/u, "").trim().toLowerCase();
   const firstMessageLower = firstMessage.toLowerCase();
+  // A stored title that begins with TeleCode's per-turn output instruction is the
+  // auto-title of an old thread whose prompt led with the instruction. The stored
+  // copy is truncated, so cleanSessionTitle's full-pattern strip never matches it
+  // and it must be detected on the raw text.
+  const storedIsTruncatedBoilerplate = (thread.title ?? "").startsWith(OUTPUT_FILES_INSTRUCTION_PREFIX);
   const storedLooksAutomatic = !storedTitle ||
     storedTitle === "(untitled)" ||
+    storedIsTruncatedBoilerplate ||
     storedTitle.toLowerCase() === firstMessageLower ||
     (storedSeed.length >= 12 && firstMessageLower.startsWith(storedSeed));
   if (!storedLooksAutomatic) {

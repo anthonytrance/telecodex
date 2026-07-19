@@ -971,7 +971,7 @@ describe("CodexSessionService", () => {
     );
   });
 
-  it("prepends staged file instructions to the SDK input text", async () => {
+  it("appends staged file instructions after the SDK input text", async () => {
     const service = await CodexSessionService.create(createConfig());
     const thread = mockState.createdThreads[0];
     const callbacks = createCallbacks();
@@ -982,7 +982,7 @@ describe("CodexSessionService", () => {
     );
 
     expect(thread.runStreamed).toHaveBeenCalledWith(
-      "Files staged at /inbox:\n- log.txt\n\nanalyze this",
+      "analyze this\n\nFiles staged at /inbox:\n- log.txt",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
   });

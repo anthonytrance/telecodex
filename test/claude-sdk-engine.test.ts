@@ -342,6 +342,66 @@ describe("claude sdk engine", () => {
     expect(events.some((event) => event.type === "assistant_message_complete")).toBe(false);
   });
 
+  it("reports live context from the last request, not the turn's summed cost", async () => {
+    // A turn with three model calls re-sends the same cached prefix three
+    // times. Summing them reported millions of tokens as "context" for a
+    // conversation that never exceeded ~200k.
+    const { queryFn } = fakeQuery([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", name: "Bash", input: {} }],
+          usage: { input_tokens: 4, cache_read_input_tokens: 150_000, cache_creation_input_tokens: 900, output_tokens: 300 },
+        },
+      },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", name: "Bash", input: {} }],
+          usage: { input_tokens: 2, cache_read_input_tokens: 175_000, cache_creation_input_tokens: 400, output_tokens: 250 },
+        },
+      },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: "done" }],
+          usage: { input_tokens: 3, cache_read_input_tokens: 199_000, cache_creation_input_tokens: 500, output_tokens: 120 },
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {
+          input_tokens: 9,
+          cache_read_input_tokens: 524_000,
+          cache_creation_input_tokens: 1_800,
+          output_tokens: 670,
+        },
+      },
+    ]);
+
+    const events = await collect(runClaudeSdkTurn({ ...baseOptions, queryFn }));
+    const usage = events.find((event) => event.type === "usage_updated");
+    // Turn totals stay available for cost reporting...
+    expect(usage).toMatchObject({ inputTokens: 9, cachedInputTokens: 525_800, outputTokens: 670 });
+    // ...while contextTokens describes the last request only.
+    expect(usage).toMatchObject({ contextTokens: 3 + 199_000 + 500 + 120 });
+  });
+
+  it("leaves contextTokens unset when no assistant message carried usage", async () => {
+    const { queryFn } = fakeQuery([
+      { type: "system", subtype: "init", session_id: "s" },
+      { type: "assistant", message: { content: [{ type: "text", text: "hi" }] } },
+      { type: "result", subtype: "success", result: "hi", usage: { input_tokens: 5, output_tokens: 2 } },
+    ]);
+
+    const events = await collect(runClaudeSdkTurn({ ...baseOptions, queryFn }));
+    const usage = events.find((event) => event.type === "usage_updated");
+    expect(usage).toMatchObject({ type: "usage_updated", contextTokens: undefined });
+  });
+
   it("reports a stream that dies without a result", async () => {
     const { queryFn } = fakeQuery([
       { type: "system", subtype: "init", session_id: "s" },

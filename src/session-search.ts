@@ -45,10 +45,10 @@ const MAX_SESSION_CHARS = 600_000;
  * re-read, so without this stamp a logic change would leave stale extractions
  * in the index forever.
  */
-const EXTRACTION_VERSION = "1";
+const EXTRACTION_VERSION = "2";
 
 /** Codex rollouts wrap non-conversational context in user messages that start with these tags. */
-const SKIPPED_MESSAGE_TAGS = /^<(?:user_instructions|environment_context|turn_context|permissions|user_shell|system)[\s>]/i;
+const SKIPPED_MESSAGE_TAGS = /^<(?:user_instructions|environment_context|turn_context|permissions|recommended_plugins|user_shell|system)[\s>]/i;
 
 /** Injected instruction payloads (AGENTS.md, global instructions) recorded as user messages. */
 const SKIPPED_INSTRUCTION_PREFIXES = /^#{1,6}\s*(?:AGENTS\.md|Global codex)/i;

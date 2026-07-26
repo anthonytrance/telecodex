@@ -45,6 +45,7 @@ describe("loadConfig", () => {
     delete process.env.ENABLE_CLAUDE_PROVIDER;
     delete process.env.CLAUDE_BIN;
     delete process.env.CLAUDE_DEFAULT_MODEL;
+    delete process.env.CLAUDE_BACKEND;
     delete process.env.CLAUDE_WORKSPACE;
     delete process.env.CLAUDE_PERMISSION_MODE;
     delete process.env.CLAUDE_LARGE_SESSION_RESUME;

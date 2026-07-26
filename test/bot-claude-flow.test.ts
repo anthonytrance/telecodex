@@ -23,6 +23,7 @@ const mockClaude = vi.hoisted(() => {
   let promptGate: Promise<void> | undefined;
   let releasePromptGate: (() => void) | undefined;
   let nextEvents: Array<Record<string, unknown>> | undefined;
+  let failNextPromptDelivery = false;
   let artifactFileName: string | undefined;
 
   return {
@@ -61,6 +62,14 @@ const mockClaude = vi.hoisted(() => {
       nextEvents = undefined;
       return events;
     },
+    failNextDelivery: () => {
+      failNextPromptDelivery = true;
+    },
+    takeDeliveryFailure: () => {
+      const fail = failNextPromptDelivery;
+      failNextPromptDelivery = false;
+      return fail;
+    },
     blockNextPrompt: () => {
       promptGate = new Promise<void>((resolve) => {
         releasePromptGate = resolve;
@@ -87,6 +96,7 @@ const mockClaude = vi.hoisted(() => {
       promptGate = undefined;
       releasePromptGate = undefined;
       nextEvents = undefined;
+      failNextPromptDelivery = false;
       artifactFileName = undefined;
       createSession.mockReset();
       resumeSession.mockReset();
@@ -100,8 +110,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
   const { stripOutputFilesInstruction, extractOutputFilesDir } = await import("../src/attachments.js");
   const fs = await import("node:fs");
   const nodePath = await import("node:path");
-  return {
-  PromptNotDeliveredError: class PromptNotDeliveredError extends Error {
+  class MockPromptNotDeliveredError extends Error {
     constructor(
       readonly promptText: string,
       message: string,
@@ -109,7 +118,9 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
       super(message);
       this.name = "PromptNotDeliveredError";
     }
-  },
+  }
+  return {
+  PromptNotDeliveredError: MockPromptNotDeliveredError,
   ClaudeProviderAdapter: class {
     readonly capabilities = {
       streamingText: true,
@@ -219,6 +230,12 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
       const text = stripOutputFilesInstruction(rawText);
       mockClaude.prompts.push(text);
       mockClaude.rawPrompts.push(rawText);
+      if (mockClaude.takeDeliveryFailure()) {
+        throw new MockPromptNotDeliveredError(
+          rawText,
+          "Claude's input box never echoed the prompt text; refusing to press Enter.",
+        );
+      }
       const artifactFileName = mockClaude.getArtifactFileName();
       const outDir = extractOutputFilesDir(rawText);
       if (artifactFileName && outDir) {
@@ -431,6 +448,22 @@ describe("Claude bot flow", () => {
       metadata: expect.objectContaining({ backend: "sdk" }),
     }));
     expect(mockClaude.getActiveBackend()).toBe("sdk");
+  });
+
+  it("switches a broken PTY delivery to the SDK engine before retrying", async () => {
+    mockClaude.failNextDelivery();
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude preserve this exact prompt"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("switched this chat to the SDK engine")));
+
+    expect(mockClaude.getActiveBackend()).toBe("sdk");
+    expect(mockClaude.prompts).toEqual(["preserve this exact prompt"]);
+    const backendState = JSON.parse(readFileSync(
+      path.join(tempDir, ".telecode", "provider-state", "claude-backend.json"),
+      "utf8",
+    )) as { backends: Record<string, string> };
+    expect(backendState.backends["123"]).toBe("sdk");
   });
 
   it("delivers the Claude final answer even if Claude is backgrounded before completion", async () => {
@@ -693,6 +726,7 @@ describe("Claude bot flow", () => {
 
     await bot.handleUpdate(textUpdate(1, "/claude first"));
     await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to first")));
+    await waitForAgentSessionsIdle(tempDir);
     await bot.handleUpdate(textUpdate(2, "/new claude"));
 
     expect(mockClaude.createSession).toHaveBeenCalledTimes(2);
@@ -902,6 +936,7 @@ describe("Claude bot flow", () => {
     await waitFor(() => mockClaude.prompts.includes("hello"));
     await bot.handleUpdate(textUpdate(2, "remember this exact prompt"));
     await waitFor(() => mockClaude.prompts.includes("remember this exact prompt"));
+    await waitForAgentSessionsIdle(tempDir);
 
     await bot.handleUpdate(textUpdate(3, "/retry"));
     await waitFor(() =>

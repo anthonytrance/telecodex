@@ -133,6 +133,13 @@ export type AgentProviderEvent =
       inputTokens?: number;
       cachedInputTokens?: number;
       outputTokens?: number;
+      /**
+       * How full the context is right now, as opposed to what the turn cost.
+       * The SDK's turn totals sum every API call in the turn, so a long
+       * agentic turn re-counts the same cached prefix dozens of times; only
+       * the last request's prompt size describes the live context.
+       */
+      contextTokens?: number;
     }
   | {
       type: "compact_boundary";

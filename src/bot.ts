@@ -3098,7 +3098,28 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             deliveryFailures,
           });
           deferQueuedDispatch = true;
-          const queuedMessage = `Claude did not accept the message yet. I will retry when the session is idle, attempt ${deliveryFailures + 1} of ${MAX_CLAUDE_PROMPT_DELIVERY_FAILURES}.`;
+          // A delivery failure means the terminal engine's paste+submit dance broke, which
+          // historically happens when a Claude CLI update changes the TUI under the bridge.
+          // The SDK engine delivers prompts programmatically, so switch this context over
+          // (sticky; /backend pty reverts) instead of burning every retry on the same bug.
+          // PromptNotDeliveredError is emitted only by the PTY path. Apply this even if
+          // the persisted preference already says sdk, because a long-lived runtime can
+          // temporarily disagree with the preference that will be used after restart.
+          claudeBackendPrefs?.set(contextKey, "sdk");
+          const activeDescriptor = claudeSessions.get(contextKey);
+          if (activeDescriptor && claudeAdapter) {
+            try {
+              await claudeAdapter.setBackend?.(activeDescriptor.id, "sdk");
+              const refreshed = await claudeAdapter.getSessionInfo(activeDescriptor.id);
+              claudeSessions.set(contextKey, refreshed);
+              persistClaudeSession(contextKey, refreshed);
+            } catch (switchError) {
+              console.warn("Failed to switch the live Claude session to the SDK engine", switchError);
+            }
+          }
+          bridgeLog("backend", `auto-switch to sdk after delivery failure lane=${contextKey}`);
+          const engineNote = " The terminal engine keeps mangling the message, so I switched this chat to the SDK engine for the retry. Use /backend pty to switch back later.";
+          const queuedMessage = `Claude did not accept the message yet. I will retry when the session is idle, attempt ${deliveryFailures + 1} of ${MAX_CLAUDE_PROMPT_DELIVERY_FAILURES}.${engineNote}`;
           await replyToClaudeRunSource(source, escapeHTML(queuedMessage), {
             fallbackText: queuedMessage,
             messageThreadId,

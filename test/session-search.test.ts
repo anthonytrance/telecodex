@@ -117,6 +117,7 @@ describe("session search index", () => {
       [
         codexMetaLine("99999999-8888-7777-6666-555555555555", "C:\\ws"),
         codexMessageLine("user", "<user_instructions>ignore me</user_instructions>"),
+        codexMessageLine("user", "<recommended_plugins>Here is a list of plugins available but not installed</recommended_plugins>"),
         codexMessageLine("user", `${OUTPUT_INSTRUCTION}\n\nCan you research buying a house in Belgium`),
         codexMessageLine("assistant", "Registration duty in Flanders is worth checking first."),
       ].join("\n"),
@@ -133,6 +134,7 @@ describe("session search index", () => {
     expect(result.hits[0]!.title.toLowerCase()).toContain("house");
     expect(result.hits[0]!.title).not.toContain("Output files");
     expect(index!.search("instructions ignore").totalMatches).toBe(0);
+    expect(index!.search("plugins installed").totalMatches).toBe(0);
   });
 
   it("picks up changes to an already indexed transcript", async () => {

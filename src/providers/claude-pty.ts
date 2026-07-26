@@ -3,6 +3,8 @@ import { EventEmitter } from "node:events";
 
 import * as pty from "node-pty";
 
+import { stripOutputFilesInstruction } from "../attachments.js";
+
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r/g;
 const BUFFER_LIMIT = 256 * 1024;
 // Prompts longer than this are sent via bracketed paste even without newlines.
@@ -19,6 +21,14 @@ export interface ClaudePtySpawnOptions {
   configDir?: string;
   cols?: number;
   rows?: number;
+}
+
+/** Prompt text was written but never appeared in the CLI's input box, so Enter was not pressed. */
+export class PromptEchoMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PromptEchoMissingError";
+  }
 }
 
 export class ClaudePty extends EventEmitter {
@@ -154,6 +164,10 @@ export class ClaudePty extends EventEmitter {
   }
 
   async sendPrompt(text: string): Promise<void> {
+    // Echo validation must only inspect terminal output produced by this send. Keeping
+    // an earlier prompt in the capture buffer could otherwise make a failed repeat look
+    // successful and cause us to press Enter on corrupted input.
+    this.clearBuffer();
     // Bracketed paste for anything multi-line or long: character-at-a-time input of a
     // long text is slow and can trip TUI shortcuts, and paste is what interactive use does.
     const paste = /\r|\n/.test(text) || text.length > LONG_PROMPT_PASTE_THRESHOLD;
@@ -164,7 +178,50 @@ export class ClaudePty extends EventEmitter {
       this.requireProc().write(text);
       await this.waitForInputSettled(text.length, 150);
     }
+    // Never press Enter blind. A CLI update can change input handling under the bridge
+    // (2.1.215 did); blind Enter then submits screen junk as a real API turn. Only submit
+    // once the typed text (or the CLI's collapsed-paste placeholder) is visibly echoed.
+    if (!(await this.waitForPromptEcho(text, 4000))) {
+      throw new PromptEchoMissingError(
+        "Claude's input box never echoed the prompt text; refusing to press Enter.",
+      );
+    }
     this.pressEnter();
+  }
+
+  /**
+   * True once the input echo for the actual user text is on screen, or the CLI shows its
+   * "[Pasted text #N +M lines]" collapse marker. TeleCode's output-folder instruction is
+   * deliberately excluded: Claude 2.1.215 once echoed only that line while replacing the
+   * user's message with TUI chrome. Compares whitespace-stripped so input-box wrapping
+   * and redraw splits cannot cause misses.
+   */
+  private async waitForPromptEcho(text: string, timeoutMs: number): Promise<boolean> {
+    const userText = stripOutputFilesInstruction(text).trim() || text.trim();
+    const compactText = userText.replace(/\s+/g, "");
+    // The input box shows the head of short input but may scroll to the cursor for long
+    // input, so accept either end of the user-controlled portion as proof of the echo.
+    const probes = [...new Set([compactText.slice(0, 24), compactText.slice(-24)].filter(Boolean))];
+    if (probes.length === 0) {
+      return true;
+    }
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      // sendPrompt clears rawBuffer immediately before writing, so the whole bounded
+      // buffer belongs to this delivery attempt. Keep the first echo even if later TUI
+      // repaint traffic would push it outside a small tail window.
+      const compactTail = this.strippedText().replace(/\s+/g, "");
+      if (
+        probes.some((probe) => compactTail.includes(probe)) ||
+        /\[Pastedtext#\d+(?:\+\d+lines?)?\]/i.test(compactTail)
+      ) {
+        return true;
+      }
+      if (Date.now() > deadline) {
+        return false;
+      }
+      await sleep(250);
+    }
   }
 
   /**

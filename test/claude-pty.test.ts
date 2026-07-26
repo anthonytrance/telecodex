@@ -1,15 +1,20 @@
-import { ClaudePty } from "../src/providers/claude-pty.js";
+import { vi } from "vitest";
+
+import { ClaudePty, PromptEchoMissingError } from "../src/providers/claude-pty.js";
 
 function appendPtyText(pty: ClaudePty, text: string): void {
   (pty as unknown as { rawBuffer: string }).rawBuffer += text;
   (pty as unknown as { receivedBytes: number }).receivedBytes += text.length;
 }
 
-function fakeProc(pty: ClaudePty): Array<{ data: string; at: number }> {
+function fakeProc(pty: ClaudePty, echoInput = true): Array<{ data: string; at: number }> {
   const writes: Array<{ data: string; at: number }> = [];
   (pty as unknown as { proc: { write: (data: string) => void } }).proc = {
     write: (data: string) => {
       writes.push({ data, at: Date.now() });
+      if (echoInput && data !== "\r" && data !== "\x15") {
+        appendPtyText(pty, data.replace(/^\x1b\[200~/u, "").replace(/\x1b\[201~$/u, ""));
+      }
     },
   };
   return writes;
@@ -79,5 +84,33 @@ describe("ClaudePty prompt delivery", () => {
 
     expect(writes[0]?.data).toBe("\x1b[200~line one\nline two\x1b[201~");
     expect(writes[writes.length - 1]?.data).toBe("\r");
+  });
+
+  it("does not accept the output-folder line as proof that the user text was pasted", async () => {
+    vi.useFakeTimers();
+    try {
+      const pty = new ClaudePty();
+      const writes = fakeProc(pty, false);
+      const prompt = [
+        "Please repair the session search and restart TeleCode.",
+        "",
+        "Output files: write any files the user should receive to C:\\workspace\\turns\\abc\\out",
+      ].join("\n");
+
+      // This is the 2.1.215 failure mode: terminal chrome plus the output-folder
+      // instruction appeared, but the actual user message did not.
+      const sending = expect(pty.sendPrompt(prompt)).rejects.toBeInstanceOf(PromptEchoMissingError);
+      appendPtyText(
+        pty,
+        "TeleCode 690046857 bypass permissions on (shift+tab to cycle) " +
+          "Output files: write any files the user should receive to C:\\workspace\\turns\\abc\\out",
+      );
+      await vi.runAllTimersAsync();
+      await sending;
+
+      expect(writes.map((entry) => entry.data)).toEqual([`\x1b[200~${prompt}\x1b[201~`]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

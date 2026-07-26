@@ -52,6 +52,8 @@ export interface SdkMessageLike {
   message?: {
     model?: string;
     content?: Array<Record<string, unknown>>;
+    /** Per-message usage; its prompt fields are the live context size. */
+    usage?: Record<string, unknown>;
   };
   result?: string;
   usage?: Record<string, unknown>;
@@ -154,6 +156,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   };
 
   let lastModel: string | undefined;
+  let lastContextTokens: number | undefined;
   let activeProviderSessionId = options.resume;
   const inputController = options.inputController;
 
@@ -208,6 +211,17 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
           }
 
           if (message.type === "assistant") {
+            // The prompt of the most recent API call is the live context size.
+            const assistantUsage = message.message?.usage;
+            if (assistantUsage) {
+              const prompt = (asNumber(assistantUsage.input_tokens) ?? 0) +
+                (asNumber(assistantUsage.cache_read_input_tokens) ?? 0) +
+                (asNumber(assistantUsage.cache_creation_input_tokens) ?? 0);
+              const completion = asNumber(assistantUsage.output_tokens) ?? 0;
+              if (prompt > 0) {
+                lastContextTokens = prompt + completion;
+              }
+            }
             const deliveredSteerCount = inputController?.deliveredCount ?? 0;
             if (deliveredSteerCount !== finalAssistantTextSteerCount) {
               // Text emitted before a priority-now steer belongs to the interrupted
@@ -264,7 +278,18 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
             const cachedInputTokens = (asNumber(usage.cache_read_input_tokens) ?? 0) +
               (asNumber(usage.cache_creation_input_tokens) ?? 0);
             const outputTokens = asNumber(usage.output_tokens) ?? 0;
-            yield { type: "usage_updated", sessionId, jobId, inputTokens, cachedInputTokens, outputTokens };
+            // These three are the turn's totals across every API call it made;
+            // contextTokens is the live prompt size. Reporting the totals as
+            // "context" produced millions-of-tokens readings on long turns.
+            yield {
+              type: "usage_updated",
+              sessionId,
+              jobId,
+              inputTokens,
+              cachedInputTokens,
+              outputTokens,
+              contextTokens: lastContextTokens,
+            };
 
             if (message.subtype === "success") {
               const resultText = (message.result ?? "").trim();

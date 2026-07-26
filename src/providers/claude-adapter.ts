@@ -23,6 +23,7 @@ import {
   CLAUDE_RESUME_WARNING_MARKERS,
   CLAUDE_TRUST_MARKERS,
   ClaudePty,
+  PromptEchoMissingError,
 } from "./claude-pty.js";
 import {
   ClaudeProcessRegistry,
@@ -32,7 +33,6 @@ import {
   findTranscript,
   locateActiveTranscript,
   locateActiveTranscriptTurnByPrompt,
-  locateSingleHumanPromptTurn,
   locateTranscriptTurnByPrompt,
   sessionIdFromTranscriptPath,
   snapshotTranscriptSizes,
@@ -132,6 +132,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       model: asString(options.metadata?.model) || this.config.claudeDefaultModel,
       permissionMode: asPermissionMode(options.metadata?.permissionMode) || this.config.claudePermissionMode,
       status: "idle",
+      // Without this the caller's engine choice was dropped here and every new session
+      // silently fell back to config.claudeBackend, ignoring the saved per-chat preference.
+      backend: asClaudeBackend(options.metadata?.backend),
     });
     const runtime = this.runtimeFromDescriptor(descriptor);
     this.sessions.set(descriptor.id, runtime);
@@ -225,6 +228,15 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         }
       }
       if (startupError) {
+        // Compaction/resume can leave the interactive TUI showing its footer without a
+        // usable input prompt. The user's text has not been sent at this point, so keep it
+        // retryable and let the bot move the retry to the programmatic SDK engine.
+        if (isPtyReadinessFailure(startupError)) {
+          throw new PromptNotDeliveredError(
+            promptText,
+            `Claude's terminal did not become ready for the message. ${errorMessage(startupError)}`,
+          );
+        }
         throw startupError;
       }
       const modelCommand = parseClaudeModelCommand(promptText);
@@ -309,7 +321,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
             inputTokens: event.inputTokens ?? 0,
             cachedInputTokens: event.cachedInputTokens ?? 0,
             outputTokens: event.outputTokens ?? 0,
-            contextTokens: (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
+            // Prefer the engine's live prompt size; the input/cached figures
+            // are turn totals and overstate context on multi-call turns.
+            contextTokens: event.contextTokens
+              ?? (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
           };
         } else if (event.type === "model_updated") {
           runtime.model = event.model;
@@ -487,7 +502,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
             inputTokens: event.inputTokens ?? 0,
             cachedInputTokens: event.cachedInputTokens ?? 0,
             outputTokens: event.outputTokens ?? 0,
-            contextTokens: (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
+            // Prefer the engine's live prompt size; the input/cached figures
+            // are turn totals and overstate context on multi-call turns.
+            contextTokens: event.contextTokens
+              ?? (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
           };
         } else if (event.type === "model_updated") {
           runtime.model = event.model;
@@ -564,10 +582,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   async getContext(sessionId: string): Promise<Record<string, unknown>> {
     const runtime = this.requireRuntime(sessionId);
     const used = runtime.lastUsage?.contextTokens ?? 0;
+    const window = contextWindowForModel(runtime.model) ?? this.config.claudeContextWindow;
     return {
       usedTokens: used,
-      contextWindow: this.config.claudeContextWindow,
-      percent: this.config.claudeContextWindow > 0 ? used / this.config.claudeContextWindow : 0,
+      contextWindow: window,
+      percent: window > 0 ? used / window : 0,
     };
   }
 
@@ -944,8 +963,27 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           });
     };
 
+    // A missing input echo means the CLI's input handling changed or broke; the prompt
+    // was NOT submitted, so surface it as retryable delivery failure (bot requeues the
+    // user's text and can fall back to the SDK engine) instead of a session-killing error.
+    const guardedSend = async (): Promise<void> => {
+      try {
+        await send();
+      } catch (error) {
+        if (error instanceof PromptEchoMissingError && runtime.pty?.isAlive) {
+          const tail = screenTail(runtime.pty);
+          runtime.pty.clearInput();
+          throw new PromptNotDeliveredError(
+            promptText,
+            `${error.message} Screen tail: ${tail}`,
+          );
+        }
+        throw error;
+      }
+    };
+
     const before = await snapshotTranscriptSizes(configDir);
-    await send();
+    await guardedSend();
 
     let active = await locate(before, knownOffset, requirePromptEcho ? 8000 : 30000);
     if (!active && requirePromptEcho && runtime.pty?.isAlive) {
@@ -955,7 +993,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         await sleep(100);
         const retryKnownOffset = knownPath && existsSync(knownPath) ? safeFileSize(knownPath) : 0;
         const retryBefore = await snapshotTranscriptSizes(configDir);
-        await send();
+        await guardedSend();
         active = await locate(retryBefore, retryKnownOffset, 30000);
       } else {
         active = await locate(before, knownOffset, 22000);
@@ -974,17 +1012,6 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         if (recovered) {
           return this.reconcileLocatedTranscript(runtime, recovered);
         }
-        const singlePrompt = await locateSingleHumanPromptTurn({
-          expectedSessionId: runtime.providerSessionId,
-          knownPath,
-          minOffset: knownOffset,
-          before,
-          configDir,
-        });
-        if (singlePrompt) {
-          return this.reconcileLocatedTranscript(runtime, singlePrompt);
-        }
-
         const tail = screenTail(runtime.pty);
         // Do not type /exit here. On prompt-location failure Claude may still have the
         // user's prompt sitting in the input box; graceful /exit would append to it and
@@ -1057,6 +1084,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     model: string;
     permissionMode: ClaudePermissionMode;
     status: AgentSessionDescriptor["status"];
+    backend?: ClaudeBackend;
   }): AgentSessionDescriptor {
     const now = Date.now();
     return {
@@ -1072,6 +1100,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       metadata: {
         model: options.model,
         permissionMode: options.permissionMode,
+        ...(options.backend ? { backend: options.backend } : {}),
       },
     };
   }
@@ -1108,6 +1137,26 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       throw new Error("Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.");
     }
   }
+}
+
+// CLAUDE_CONTEXT_WINDOW is one number for every model, which reported an Opus 5
+// session as five times over its window. The model's own window wins when we
+// recognise it; the configured value stays the fallback for anything new.
+const CLAUDE_CONTEXT_WINDOWS: ReadonlyArray<readonly [RegExp, number]> = [
+  [/haiku/iu, 200_000],
+  [/opus|sonnet|fable|mythos/iu, 1_000_000],
+];
+
+export function contextWindowForModel(model: string | undefined): number | undefined {
+  if (!model) {
+    return undefined;
+  }
+  for (const [pattern, window] of CLAUDE_CONTEXT_WINDOWS) {
+    if (pattern.test(model)) {
+      return window;
+    }
+  }
+  return undefined;
 }
 
 function promptToText(input: AgentSendPromptOptions["input"]): string {
@@ -1217,6 +1266,15 @@ function appendScreenTail(message: string, ptySession: ClaudePty | undefined): s
     return message;
   }
   return `${message}. Screen tail: ${tail}`;
+}
+
+function isPtyReadinessFailure(error: unknown): boolean {
+  return /(?:did not reach a ready prompt|never became ready|prompt did not become ready|prompt did not settle)/iu
+    .test(errorMessage(error));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**

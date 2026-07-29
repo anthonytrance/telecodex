@@ -28,6 +28,12 @@ interface TeleCodePreferences {
   codexMcpEnabled?: boolean;
 }
 
+interface LegacyPersistedContexts {
+  version?: number;
+  preferredModel?: string;
+  contexts: ContextMetadata[];
+}
+
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionRuntime>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
@@ -262,8 +268,15 @@ export class SessionRegistry {
         return;
       }
       const raw = readFileSync(this.persistPath, "utf8");
-      const data = parseJsonFileText<ContextMetadata[]>(raw);
-      for (const entry of data) {
+      const data = parseJsonFileText<ContextMetadata[] | LegacyPersistedContexts>(raw);
+      const contexts = Array.isArray(data) ? data : data.contexts;
+      if (!Array.isArray(contexts)) {
+        return;
+      }
+      if (!Array.isArray(data) && data.preferredModel) {
+        this.selectedCodexModel = data.preferredModel;
+      }
+      for (const entry of contexts) {
         if (entry.contextKey) {
           this.metadata.set(entry.contextKey, {
             ...entry,

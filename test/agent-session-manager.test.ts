@@ -180,6 +180,41 @@ describe("AgentSessionManager", () => {
     expect(manager.getSelectedSession("123:42")?.providerSessionId).toBe("thread-b");
   });
 
+  it("reconciles and reselects an existing legacy session when its context thread changes", () => {
+    const manager = createManager();
+    manager.importLegacyContexts([{
+      contextKey: "123",
+      threadId: "wrong-thread",
+      workspace: "/workspace/old",
+      model: "old-model",
+      updatedAt: 1,
+    }]);
+    const newer = manager.createSession("123", "codex", {
+      workspace: "/workspace/current",
+      providerSessionId: "newer-thread",
+    });
+    expect(manager.getSelectedSession("123")?.id).toBe(newer.id);
+
+    const [restored] = manager.importLegacyContexts([{
+      contextKey: "123",
+      threadId: "original-thread",
+      workspace: "/workspace/restored",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
+      updatedAt: 2,
+    }], { selectImported: true });
+
+    expect(restored).toMatchObject({
+      providerSessionId: "original-thread",
+      workspace: "/workspace/restored",
+      metadata: {
+        model: "gpt-5.6-sol",
+        reasoningEffort: "high",
+      },
+    });
+    expect(manager.getSelectedSession("123")?.id).toBe(restored!.id);
+  });
+
   it("serializes and reloads state", () => {
     const manager = createManager();
     const session = manager.createSession("123", "claude", { workspace: "/workspace" });

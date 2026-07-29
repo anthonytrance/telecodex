@@ -122,6 +122,9 @@ const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
 const CLAUDE_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r/g;
+// A 50-entry default overflows one Telegram message and pushes the list footer
+// into a second chunk. Keep the default inside a single message; `/sessions all`
+// is the escape hatch for the long history.
 const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 20;
 const MAX_PROVIDER_SESSION_LIST_LIMIT = 500;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";

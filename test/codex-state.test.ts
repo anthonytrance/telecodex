@@ -228,6 +228,88 @@ describe("codex-state", () => {
     expect(state.listThreads()).toEqual([]);
   });
 
+  it("parses a Codex JSONL session when the SQLite index is unavailable", async () => {
+    const state = await loadCodexState({ betterSqliteAvailable: false });
+    const record = state.parseSessionFileThread(
+      "/Users/tester/.codex/sessions/2026/07/rollout-2026-07-29T01-02-03-019fab0f-358c-78e2-b02d-4625104e7831.jsonl",
+      [
+        JSON.stringify({
+          timestamp: "2026-07-29T01:02:03.000Z",
+          type: "session_meta",
+          payload: {
+            id: "019fab0f-358c-78e2-b02d-4625104e7831",
+            cwd: "/workspace/old",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-07-29T01:02:04.000Z",
+          type: "turn_context",
+          payload: {
+            cwd: "/workspace/current",
+            model: "gpt-5.6-terra",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-07-29T01:02:05.000Z",
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "Restore every previous session",
+          },
+        }),
+      ].join("\n"),
+      Date.parse("2026-07-29T01:02:06.000Z"),
+    );
+
+    expect(record).toEqual({
+      id: "019fab0f-358c-78e2-b02d-4625104e7831",
+      title: "",
+      cwd: "/workspace/current",
+      model: "gpt-5.6-terra",
+      createdAt: new Date("2026-07-29T01:02:03.000Z"),
+      updatedAt: new Date("2026-07-29T01:02:06.000Z"),
+      firstUserMessage: "Restore every previous session",
+    });
+  });
+
+  it("parses a session record from a truncated head, ignoring the severed tail", async () => {
+    const state = await loadCodexState({ files: [] });
+    const head = [
+      JSON.stringify({
+        timestamp: "2026-07-29T01:02:03.000Z",
+        type: "session_meta",
+        payload: { id: "019fab0f-358c-78e2-b02d-4625104e7831", cwd: "/workspace/current" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-07-29T01:02:04.000Z",
+        type: "turn_context",
+        payload: { model: "gpt-5.6-terra" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-07-29T01:02:05.000Z",
+        type: "event_msg",
+        payload: { type: "user_message", message: "Restore every previous session" },
+      }),
+      // Transcripts run to hundreds of megabytes, so only their head is read and
+      // the final line arrives cut in half.
+      '{"timestamp":"2026-07-29T01:02:06.000Z","type":"event_msg","payl',
+    ].join("\n");
+
+    const record = state.parseSessionFileThread(
+      "/Users/tester/.codex/sessions/rollout-019fab0f-358c-78e2-b02d-4625104e7831.jsonl",
+      head,
+      Date.parse("2026-07-29T09:00:00.000Z"),
+    );
+
+    expect(record?.id).toBe("019fab0f-358c-78e2-b02d-4625104e7831");
+    expect(record?.cwd).toBe("/workspace/current");
+    expect(record?.model).toBe("gpt-5.6-terra");
+    expect(record?.firstUserMessage).toBe("Restore every previous session");
+    expect(record?.createdAt).toEqual(new Date("2026-07-29T01:02:03.000Z"));
+    // The tail is unread, so the file's own mtime is the only honest last-write time.
+    expect(record?.updatedAt).toEqual(new Date("2026-07-29T09:00:00.000Z"));
+  });
+
   it("listThreads returns mapped active thread records", async () => {
     const state = await loadCodexState({
       files: ["state_main.sqlite"],

@@ -282,6 +282,20 @@ export class AgentSessionManager {
       const sessionId = `legacy-codex-${shortHash(context.contextKey)}`;
       const existing = this.sessions.get(sessionId);
       if (existing) {
+        existing.providerSessionId = context.threadId ?? undefined;
+        existing.workspace = context.workspace;
+        existing.metadata = {
+          backend: context.backend,
+          launchProfileId: context.launchProfileId,
+          model: context.model,
+          progressDelivery: context.progressDelivery,
+          reasoningEffort: context.reasoningEffort,
+          legacyContextKey: context.contextKey,
+        };
+        existing.updatedAt = this.now();
+        if (options.selectImported ?? true) {
+          this.selectSession(context.contextKey, sessionId);
+        }
         imported.push(cloneSession(existing));
         continue;
       }

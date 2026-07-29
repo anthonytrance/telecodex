@@ -382,6 +382,40 @@ describe("SessionRegistry", () => {
     });
   });
 
+  it("loads legacy wrapped contexts and their preferred model", async () => {
+    const persistPath = path.join("/workspace/base", ".telecode", "contexts.json");
+    mockFsState.files.set(
+      persistPath,
+      JSON.stringify({
+        version: 1,
+        preferredModel: "gpt-5.6-sol",
+        contexts: [
+          {
+            contextKey: "123",
+            threadId: "thread-a",
+            workspace: "/workspace/a",
+            model: "gpt-5.6-sol",
+            reasoningEffort: "high",
+            launchProfileId: "default",
+            updatedAt: 10,
+          },
+        ],
+      }),
+    );
+
+    const registry = new SessionRegistry(createConfig());
+    expect(registry.getDefaultModel()).toBe("gpt-5.6-sol");
+    await registry.getOrCreate("123");
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(createConfig(), {
+      workspace: "/workspace/a",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
+      launchProfileId: "default",
+      resumeThreadId: "thread-a",
+    });
+  });
+
   it("falls back to the default launch profile when persisted metadata references a missing profile", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const persistPath = path.join("/workspace/base", ".telecode", "contexts.json");

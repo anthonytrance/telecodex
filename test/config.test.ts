@@ -51,6 +51,7 @@ describe("loadConfig", () => {
     delete process.env.CLAUDE_LARGE_SESSION_RESUME;
     delete process.env.CLAUDE_TURN_IDLE_TIMEOUT;
     delete process.env.CLAUDE_CONTEXT_WINDOW;
+    delete process.env.CLAUDE_AUTO_COMPACT_WINDOW;
     delete process.env.container;
   });
 
@@ -139,6 +140,7 @@ describe("loadConfig", () => {
       claudeLargeSessionResume: "summary",
       claudeTurnIdleTimeoutSeconds: 180,
       claudeContextWindow: 200000,
+      claudeAutoCompactWindow: 200000,
       claudeBackend: "pty",
     });
   });
@@ -193,6 +195,7 @@ describe("loadConfig", () => {
     expect(config.claudeLargeSessionResume).toBe("summary");
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(180);
     expect(config.claudeContextWindow).toBe(200000);
+    expect(config.claudeAutoCompactWindow).toBe(200000);
     expect(config.workspace).toBe(process.cwd());
   });
 
@@ -378,6 +381,7 @@ describe("loadConfig", () => {
     process.env.CLAUDE_STRICT_MCP_CONFIG = "false";
     process.env.CLAUDE_TURN_IDLE_TIMEOUT = "60";
     process.env.CLAUDE_CONTEXT_WINDOW = "123456";
+    process.env.CLAUDE_AUTO_COMPACT_WINDOW = "234567";
 
     const config = loadConfig();
 
@@ -391,6 +395,7 @@ describe("loadConfig", () => {
     expect(config.claudeLargeSessionResume).toBe("full");
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(60);
     expect(config.claudeContextWindow).toBe(123456);
+    expect(config.claudeAutoCompactWindow).toBe(234567);
   });
 
   it("requires unsafe launch profiles for Claude bypass permissions", () => {
@@ -471,6 +476,7 @@ describe("loadConfig", () => {
     process.env.CLAUDE_PERMISSION_MODE = "loud";
     process.env.CLAUDE_TURN_IDLE_TIMEOUT = "soon";
     process.env.CLAUDE_CONTEXT_WINDOW = "huge";
+    process.env.CLAUDE_AUTO_COMPACT_WINDOW = "eventually";
     process.env.MAX_FILE_SIZE = "nope";
 
     const config = loadConfig();
@@ -483,8 +489,9 @@ describe("loadConfig", () => {
     expect(config.claudePermissionMode).toBe("acceptEdits");
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(180);
     expect(config.claudeContextWindow).toBe(200000);
+    expect(config.claudeAutoCompactWindow).toBe(200000);
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
-    expect(warnSpy).toHaveBeenCalledTimes(9);
+    expect(warnSpy).toHaveBeenCalledTimes(10);
   });
 
   it("parses explicit launch profiles and default selection", () => {

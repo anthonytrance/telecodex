@@ -34,6 +34,8 @@ export interface ClaudeSdkTurnOptions {
   inputController?: ClaudeSdkInputController;
   /** Emit a visible status when the SDK has produced no events for this long. */
   quietStatusIntervalMs?: number;
+  /** Effective window Claude Code uses when deciding when to auto-compact. */
+  autoCompactWindow?: number;
   /** Injectable for tests; defaults to the real SDK query(). */
   queryFn?: (input: {
     prompt: string | AsyncIterable<SdkUserMessageLike>;
@@ -42,6 +44,29 @@ export interface ClaudeSdkTurnOptions {
     close?: () => void;
     streamInput?: (stream: AsyncIterable<SdkUserMessageLike>) => Promise<void>;
   };
+}
+
+export interface ClaudeSdkCompactOptions {
+  cwd: string;
+  claudeBin: string;
+  model?: string;
+  permissionMode: ClaudePermissionMode;
+  /** Existing provider session to compact in place. */
+  resume: string;
+  instructions?: string;
+  abortController?: AbortController;
+  timeoutMs?: number;
+  autoCompactWindow?: number;
+  onProviderSessionId?: (providerSessionId: string) => void;
+  /** Injectable for tests; defaults to the real SDK query(). */
+  queryFn?: ClaudeSdkTurnOptions["queryFn"];
+}
+
+export interface ClaudeSdkCompactResult {
+  providerSessionId: string;
+  preTokens?: number;
+  postTokens?: number;
+  trigger?: "manual" | "auto";
 }
 
 /** Structural view of the SDK messages this engine consumes. */
@@ -57,6 +82,12 @@ export interface SdkMessageLike {
   };
   result?: string;
   usage?: Record<string, unknown>;
+  compact_metadata?: {
+    trigger?: "manual" | "auto";
+    pre_tokens?: number;
+    post_tokens?: number;
+    duration_ms?: number;
+  };
   total_cost_usd?: number;
   errors?: unknown[];
 }
@@ -135,25 +166,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   const queryFn = options.queryFn ?? (await loadSdkQuery());
   const { sessionId, jobId } = options;
 
-  const baseSdkOptions: Record<string, unknown> = {
-    cwd: options.cwd,
-    model: options.model,
-    permissionMode: options.permissionMode,
-    pathToClaudeCodeExecutable: options.claudeBin,
-    // Behave like the user's interactive sessions: Claude Code system prompt,
-    // user + project settings, CLAUDE.md, and skills.
-    systemPrompt: { type: "preset", preset: "claude_code" },
-    settingSources: ["user", "project"],
-    // Rule 1: the child must never start the user-scoped telegram plugin's
-    // poller (it kills the live bridge via a 409 on the shared bot token, and
-    // the C0 spike proved plugins load even without settingSources). Same flag
-    // the PTY path uses in production.
-    strictMcpConfig: true,
-    env: scrubbedEnv(),
-    ...(options.resume ? { resume: options.resume } : {}),
-    ...(options.forkSession ? { forkSession: true } : {}),
-    ...(options.abortController ? { abortController: options.abortController } : {}),
-  };
+  const baseSdkOptions = buildSdkQueryOptions(options);
 
   let lastModel: string | undefined;
   let lastContextTokens: number | undefined;
@@ -207,6 +220,21 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
               activeProviderSessionId = message.session_id;
               options.onProviderSessionId?.(message.session_id);
             }
+            continue;
+          }
+
+          if (message.type === "system" && message.subtype === "compact_boundary") {
+            const preTokens = asNumber(message.compact_metadata?.pre_tokens);
+            const postTokens = asNumber(message.compact_metadata?.post_tokens);
+            if (postTokens !== undefined) {
+              lastContextTokens = postTokens;
+            }
+            yield {
+              type: "compact_boundary",
+              sessionId,
+              summary: formatSdkCompactBoundary(preTokens, postTokens),
+              postTokens,
+            };
             continue;
           }
 
@@ -388,6 +416,100 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   }
 }
 
+/**
+ * Run Claude Code's native `/compact` command through the Agent SDK.
+ *
+ * A successful compact command normally has no assistant text. Its authoritative
+ * success signal is the SDK's compact_boundary system event, so this path must
+ * not use the normal empty-response retry behavior.
+ */
+export async function runClaudeSdkCompact(
+  options: ClaudeSdkCompactOptions,
+): Promise<ClaudeSdkCompactResult> {
+  const resume = options.resume.trim();
+  if (!resume) {
+    throw new Error("Claude SDK compaction requires an existing provider session");
+  }
+
+  const queryFn = options.queryFn ?? (await loadSdkQuery());
+  const abortController = options.abortController ?? new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abortController.abort();
+  }, options.timeoutMs ?? 180_000);
+  timer.unref?.();
+
+  const command = options.instructions?.trim()
+    ? `/compact ${options.instructions.trim()}`
+    : "/compact";
+  const query = queryFn({
+    prompt: command,
+    options: buildSdkQueryOptions({
+      ...options,
+      resume,
+      abortController,
+    }),
+  });
+
+  let providerSessionId = resume;
+  let compactResult: ClaudeSdkCompactResult | undefined;
+  let sawResult = false;
+
+  try {
+    for await (const message of query) {
+      if (message.type === "system" && message.subtype === "init" && message.session_id) {
+        providerSessionId = message.session_id;
+        options.onProviderSessionId?.(message.session_id);
+        continue;
+      }
+
+      if (message.type === "system" && message.subtype === "compact_boundary") {
+        if (message.session_id) {
+          providerSessionId = message.session_id;
+          options.onProviderSessionId?.(message.session_id);
+        }
+        compactResult = {
+          providerSessionId,
+          preTokens: asNumber(message.compact_metadata?.pre_tokens),
+          postTokens: asNumber(message.compact_metadata?.post_tokens),
+          trigger: message.compact_metadata?.trigger,
+        };
+        continue;
+      }
+
+      if (message.type !== "result") {
+        continue;
+      }
+      sawResult = true;
+      if (message.subtype !== "success") {
+        const detail = message.result?.trim() ||
+          describeSdkErrors(message.errors) ||
+          message.subtype ||
+          "unknown error";
+        throw new Error(`Claude SDK compaction ended: ${detail}`);
+      }
+      break;
+    }
+  } catch (error) {
+    if (timedOut) {
+      throw new Error("Claude SDK compaction did not finish before timeout", { cause: error });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    query.close?.();
+  }
+
+  if (!sawResult) {
+    throw new Error("Claude SDK compaction stream ended without a result message");
+  }
+  if (!compactResult) {
+    throw new Error("Claude SDK reported success without a compact boundary");
+  }
+  return compactResult;
+}
+
 async function* initialPromptAndLiveInput(
   promptText: string,
   inputController: ClaudeSdkInputController,
@@ -465,6 +587,35 @@ async function loadSdkQuery(): Promise<NonNullable<ClaudeSdkTurnOptions["queryFn
   return sdk.query as unknown as NonNullable<ClaudeSdkTurnOptions["queryFn"]>;
 }
 
+function buildSdkQueryOptions(options: {
+  cwd: string;
+  claudeBin: string;
+  model?: string;
+  permissionMode: ClaudePermissionMode;
+  resume?: string;
+  forkSession?: boolean;
+  abortController?: AbortController;
+  autoCompactWindow?: number;
+}): Record<string, unknown> {
+  return {
+    cwd: options.cwd,
+    model: options.model,
+    permissionMode: options.permissionMode,
+    pathToClaudeCodeExecutable: options.claudeBin,
+    // Behave like the user's interactive sessions: Claude Code system prompt,
+    // user + project settings, CLAUDE.md, and skills.
+    systemPrompt: { type: "preset", preset: "claude_code" },
+    settingSources: ["user", "project"],
+    // The child must never start the user-scoped Telegram plugin's poller. It
+    // would compete with this bridge for the same bot token.
+    strictMcpConfig: true,
+    env: scrubbedEnv(options.autoCompactWindow),
+    ...(options.resume ? { resume: options.resume } : {}),
+    ...(options.forkSession ? { forkSession: true } : {}),
+    ...(options.abortController ? { abortController: options.abortController } : {}),
+  };
+}
+
 function sdkUserMessage(text: string, priority?: SdkUserMessageLike["priority"]): SdkUserMessageLike {
   return {
     type: "user",
@@ -479,7 +630,7 @@ function sdkUserMessage(text: string, priority?: SdkUserMessageLike["priority"])
   };
 }
 
-function scrubbedEnv(): Record<string, string | undefined> {
+function scrubbedEnv(autoCompactWindow?: number): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env };
   delete env.TELEGRAM_BOT_TOKEN;
   for (const key of Object.keys(env)) {
@@ -492,7 +643,20 @@ function scrubbedEnv(): Record<string, string | undefined> {
       delete env[key];
     }
   }
+  if (autoCompactWindow !== undefined && Number.isSafeInteger(autoCompactWindow) && autoCompactWindow > 0) {
+    env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(autoCompactWindow);
+  }
   return env;
+}
+
+function formatSdkCompactBoundary(preTokens?: number, postTokens?: number): string {
+  if (preTokens !== undefined && postTokens !== undefined) {
+    return `Compacted: ${preTokens.toLocaleString("en-US")} -> ${postTokens.toLocaleString("en-US")} tokens`;
+  }
+  if (postTokens !== undefined) {
+    return `Compacted to ${postTokens.toLocaleString("en-US")} tokens`;
+  }
+  return "Claude context compacted.";
 }
 
 function summarizeSdkToolInput(input: unknown): string | undefined {

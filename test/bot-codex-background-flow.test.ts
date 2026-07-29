@@ -149,6 +149,7 @@ function createConfig(workspace: string): TeleCodeConfig {
     claudeLargeSessionResume: "summary",
     claudeTurnIdleTimeoutSeconds: 180,
     claudeContextWindow: 200000,
+    claudeAutoCompactWindow: 200000,
     claudeBackend: "pty",
   };
 }

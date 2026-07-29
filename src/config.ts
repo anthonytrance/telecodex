@@ -51,6 +51,8 @@ export interface TeleCodeConfig {
   claudeLargeSessionResume: ClaudeLargeSessionResumePolicy;
   claudeTurnIdleTimeoutSeconds: number;
   claudeContextWindow: number;
+  /** Effective Claude Code window used to trigger automatic compaction. */
+  claudeAutoCompactWindow: number;
   /** Default Claude engine for contexts that never ran /backend: pty or sdk. */
   claudeBackend: "pty" | "sdk";
 }
@@ -125,6 +127,11 @@ export function loadConfig(): TeleCodeConfig {
     200000,
     "CLAUDE_CONTEXT_WINDOW",
   );
+  const claudeAutoCompactWindow = parsePositiveIntegerEnv(
+    optionalString(process.env.CLAUDE_AUTO_COMPACT_WINDOW),
+    200000,
+    "CLAUDE_AUTO_COMPACT_WINDOW",
+  );
   const rawClaudeBackend = optionalString(process.env.CLAUDE_BACKEND) ?? "pty";
   if (rawClaudeBackend !== "pty" && rawClaudeBackend !== "sdk") {
     throw new Error(`CLAUDE_BACKEND must be "pty" or "sdk", got: ${rawClaudeBackend}`);
@@ -161,6 +168,7 @@ export function loadConfig(): TeleCodeConfig {
     claudeLargeSessionResume,
     claudeTurnIdleTimeoutSeconds,
     claudeContextWindow,
+    claudeAutoCompactWindow,
     claudeBackend: rawClaudeBackend,
   };
 }

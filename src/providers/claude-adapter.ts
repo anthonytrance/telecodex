@@ -5,7 +5,11 @@ import { randomUUID } from "node:crypto";
 
 import { bridgeLog } from "../bridge-log.js";
 import type { ClaudePermissionMode, TeleCodeConfig } from "../config.js";
-import { ClaudeSdkInputController, runClaudeSdkTurn } from "./claude-sdk-engine.js";
+import {
+  ClaudeSdkInputController,
+  runClaudeSdkCompact,
+  runClaudeSdkTurn,
+} from "./claude-sdk-engine.js";
 import type {
   AgentProviderAdapter,
   AgentProviderCapabilities,
@@ -482,6 +486,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         abortController,
         inputController,
         quietStatusIntervalMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
+        autoCompactWindow: this.config.claudeAutoCompactWindow,
         onProviderSessionId: (providerSessionId) => {
           runtime.forkSourceSessionId = undefined;
           if (runtime.descriptor.metadata?.forkSourceSessionId) {
@@ -511,6 +516,15 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           runtime.model = event.model;
           runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model: event.model };
           runtime.descriptor.updatedAt = Date.now();
+        } else if (event.type === "compact_boundary") {
+          if (event.postTokens !== undefined) {
+            runtime.lastUsage = {
+              inputTokens: runtime.lastUsage?.inputTokens ?? 0,
+              cachedInputTokens: runtime.lastUsage?.cachedInputTokens ?? 0,
+              outputTokens: runtime.lastUsage?.outputTokens ?? 0,
+              contextTokens: event.postTokens,
+            };
+          }
         } else if (event.type === "error") {
           // Mirror the PTY path: salvage streamed partial text into a completion,
           // otherwise fail the turn.
@@ -543,18 +557,64 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
   }
 
-  async compact(sessionId: string): Promise<void> {
+  async compact(sessionId: string, instructions?: string): Promise<void> {
     const runtime = this.requireRuntime(sessionId);
     if (runtime.busy) {
       throw new Error("Cannot compact while Claude is running");
     }
     runtime.busy = true;
     try {
+      if (runtime.backend === "sdk") {
+        if (!runtime.hasLiveProviderSession) {
+          throw new Error("Nothing to compact yet. Send at least one message to Claude first.");
+        }
+        if (runtime.pty) {
+          await this.stopRuntimePty(runtime);
+        }
+        const abortController = new AbortController();
+        runtime.sdkAbortController = abortController;
+        try {
+          const result = await runClaudeSdkCompact({
+            cwd: runtime.workspace,
+            claudeBin: this.config.claudeBin,
+            model: runtime.model,
+            permissionMode: runtime.permissionMode,
+            resume: runtime.providerSessionId,
+            instructions,
+            abortController,
+            timeoutMs: 180_000,
+            autoCompactWindow: this.config.claudeAutoCompactWindow,
+            onProviderSessionId: (providerSessionId) => {
+              runtime.hasLiveProviderSession = true;
+              if (providerSessionId !== runtime.providerSessionId) {
+                runtime.providerSessionId = providerSessionId;
+                runtime.descriptor.providerSessionId = providerSessionId;
+                runtime.descriptor.updatedAt = Date.now();
+              }
+            },
+          });
+          if (result.postTokens !== undefined) {
+            runtime.lastUsage = {
+              inputTokens: runtime.lastUsage?.inputTokens ?? 0,
+              cachedInputTokens: runtime.lastUsage?.cachedInputTokens ?? 0,
+              outputTokens: runtime.lastUsage?.outputTokens ?? 0,
+              contextTokens: result.postTokens,
+            };
+          }
+        } finally {
+          runtime.sdkAbortController = undefined;
+        }
+        return;
+      }
+
+      const compactCommand = instructions?.trim()
+        ? `/compact ${instructions.trim()}`
+        : "/compact";
       await this.ensurePty(runtime, "resume");
       const output = await this.locateTurnTranscript(
         runtime,
-        "/compact",
-        () => runtime.pty!.sendCommand("/compact"),
+        compactCommand,
+        () => runtime.pty!.sendCommand(compactCommand),
         { requirePromptEcho: false },
       );
       if ("fallbackText" in output) {
@@ -587,6 +647,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       usedTokens: used,
       contextWindow: window,
       percent: window > 0 ? used / window : 0,
+      autoCompactWindow: this.config.claudeAutoCompactWindow,
     };
   }
 
@@ -690,6 +751,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       args,
       cwd: runtime.workspace,
       configDir: strictMcp ? undefined : this.config.claudeConfigDir,
+      autoCompactWindow: this.config.claudeAutoCompactWindow,
     });
     runtime.ptyPid = ptySession.pid;
     if (runtime.forkSourceSessionId) {

@@ -1,6 +1,10 @@
 import { vi } from "vitest";
 
-import { ClaudePty, PromptEchoMissingError } from "../src/providers/claude-pty.js";
+import {
+  buildClaudePtyEnv,
+  ClaudePty,
+  PromptEchoMissingError,
+} from "../src/providers/claude-pty.js";
 
 function appendPtyText(pty: ClaudePty, text: string): void {
   (pty as unknown as { rawBuffer: string }).rawBuffer += text;
@@ -39,6 +43,29 @@ describe("ClaudePty readiness detection", () => {
 
     await expect(ready).resolves.toBe("\\?forshortcuts");
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2500);
+  });
+});
+
+describe("ClaudePty child environment", () => {
+  it("scrubs inherited Claude Code controls and deliberately restores the configured compact window", () => {
+    const env = buildClaudePtyEnv({
+      bin: "claude.exe",
+      args: [],
+      cwd: "C:\\workspace",
+      configDir: "C:\\isolated-claude",
+      autoCompactWindow: 200000,
+    }, {
+      PATH: "C:\\bin",
+      CLAUDECODE: "1",
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: "999999",
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
+    });
+
+    expect(env.PATH).toBe("C:\\bin");
+    expect(env.CLAUDECODE).toBeUndefined();
+    expect(env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBeUndefined();
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("200000");
+    expect(env.CLAUDE_CONFIG_DIR).toBe("C:\\isolated-claude");
   });
 });
 

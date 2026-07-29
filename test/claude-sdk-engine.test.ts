@@ -1,5 +1,6 @@
 import {
   ClaudeSdkInputController,
+  runClaudeSdkCompact,
   runClaudeSdkTurn,
   type SdkMessageLike,
   type SdkUserMessageLike,
@@ -96,11 +97,30 @@ describe("claude sdk engine", () => {
       { type: "system", subtype: "init", session_id: "s" },
       { type: "result", subtype: "success", result: "ok", usage: {} },
     ]);
+    const previousAutoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    const previousExperimentalFlag = process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS;
     process.env.TELEGRAM_BOT_TOKEN = "999:should-not-leak";
+    process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = "999999";
+    process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1";
     try {
-      await collect(runClaudeSdkTurn({ ...baseOptions, resume: "prior-session", queryFn }));
+      await collect(runClaudeSdkTurn({
+        ...baseOptions,
+        resume: "prior-session",
+        autoCompactWindow: 200000,
+        queryFn,
+      }));
     } finally {
       delete process.env.TELEGRAM_BOT_TOKEN;
+      if (previousAutoCompactWindow === undefined) {
+        delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+      } else {
+        process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = previousAutoCompactWindow;
+      }
+      if (previousExperimentalFlag === undefined) {
+        delete process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS;
+      } else {
+        process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = previousExperimentalFlag;
+      }
     }
 
     const options = seen[0]!.options;
@@ -111,6 +131,92 @@ describe("claude sdk engine", () => {
     expect(options.systemPrompt).toEqual({ type: "preset", preset: "claude_code" });
     expect(options.pathToClaudeCodeExecutable).toBe("C:\\claude.exe");
     expect((options.env as Record<string, unknown>).TELEGRAM_BOT_TOKEN).toBeUndefined();
+    expect((options.env as Record<string, unknown>).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("200000");
+    expect((options.env as Record<string, unknown>).CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBeUndefined();
+  });
+
+  it("maps SDK compact boundaries during ordinary turns", async () => {
+    const { queryFn } = fakeQuery([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        session_id: "s",
+        compact_metadata: {
+          trigger: "auto",
+          pre_tokens: 210000,
+          post_tokens: 8500,
+        },
+      },
+      { type: "result", subtype: "success", result: "continued", usage: {} },
+    ]);
+
+    const events = await collect(runClaudeSdkTurn({ ...baseOptions, queryFn }));
+
+    expect(events).toContainEqual({
+      type: "compact_boundary",
+      sessionId: baseOptions.sessionId,
+      summary: "Compacted: 210,000 -> 8,500 tokens",
+      postTokens: 8500,
+    });
+  });
+
+  it("runs native SDK compact in place and accepts its empty successful result", async () => {
+    const { queryFn, seen } = fakeQuery([
+      { type: "system", subtype: "init", session_id: "existing-session" },
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        session_id: "existing-session",
+        compact_metadata: {
+          trigger: "manual",
+          pre_tokens: 301000,
+          post_tokens: 8200,
+        },
+      },
+      { type: "result", subtype: "success", result: "", usage: {} },
+    ]);
+
+    const result = await runClaudeSdkCompact({
+      cwd: baseOptions.cwd,
+      claudeBin: baseOptions.claudeBin,
+      model: baseOptions.model,
+      permissionMode: baseOptions.permissionMode,
+      resume: "existing-session",
+      instructions: "preserve decisions and pending tests",
+      autoCompactWindow: 200000,
+      queryFn,
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.prompt).toBe("/compact preserve decisions and pending tests");
+    expect(seen[0]?.options.resume).toBe("existing-session");
+    expect(
+      (seen[0]?.options.env as Record<string, unknown>).CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+    ).toBe("200000");
+    expect(result).toEqual({
+      providerSessionId: "existing-session",
+      preTokens: 301000,
+      postTokens: 8200,
+      trigger: "manual",
+    });
+  });
+
+  it("rejects an SDK compact success that has no compact boundary", async () => {
+    const { queryFn, seen } = fakeQuery([
+      { type: "system", subtype: "init", session_id: "existing-session" },
+      { type: "result", subtype: "success", result: "", usage: {} },
+    ]);
+
+    await expect(runClaudeSdkCompact({
+      cwd: baseOptions.cwd,
+      claudeBin: baseOptions.claudeBin,
+      model: baseOptions.model,
+      permissionMode: baseOptions.permissionMode,
+      resume: "existing-session",
+      queryFn,
+    })).rejects.toThrow("without a compact boundary");
+    expect(seen).toHaveLength(1);
   });
 
   it("passes forkSession alongside resume when forking", async () => {

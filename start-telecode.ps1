@@ -63,6 +63,11 @@ $env:HOME = $env:USERPROFILE
 # The bridge loads its configured default from .env. Do not let a model value
 # inherited from an older bridge process override it after a restart.
 Remove-Item Env:CODEX_MODEL -ErrorAction SilentlyContinue
+# TeleCode launches tools from several independent Python environments.
+# Never let the shell that started TeleCode pin Codex and its skills to one
+# application's virtualenv or site-packages.
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+Remove-Item Env:VIRTUAL_ENV -ErrorAction SilentlyContinue
 if (-not $env:CODEX_HOME) {
   $env:CODEX_HOME = Join-Path $env:USERPROFILE ".codex"
 }

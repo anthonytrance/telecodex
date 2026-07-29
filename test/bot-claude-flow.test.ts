@@ -11,10 +11,12 @@ import { SessionRegistry } from "../src/session-registry.js";
 const mockClaude = vi.hoisted(() => {
   const prompts: string[] = [];
   const rawPrompts: string[] = [];
+  const promptSessionIds: string[] = [];
   const steers: string[] = [];
   const createSession = vi.fn();
   const resumeSession = vi.fn();
   const getSessionInfo = vi.fn();
+  const compact = vi.fn();
   const dispose = vi.fn();
   let createCount = 0;
   let activeModel = "sonnet";
@@ -23,12 +25,14 @@ const mockClaude = vi.hoisted(() => {
   let promptGate: Promise<void> | undefined;
   let releasePromptGate: (() => void) | undefined;
   let nextEvents: Array<Record<string, unknown>> | undefined;
+  const queuedReplies: string[] = [];
   let failNextPromptDelivery = false;
   let artifactFileName: string | undefined;
 
   return {
     prompts,
     rawPrompts,
+    promptSessionIds,
     steers,
     setArtifactFileName: (name: string | undefined) => {
       artifactFileName = name;
@@ -37,6 +41,7 @@ const mockClaude = vi.hoisted(() => {
     createSession,
     resumeSession,
     getSessionInfo,
+    compact,
     dispose,
     nextCreateCount: () => {
       createCount += 1;
@@ -62,6 +67,14 @@ const mockClaude = vi.hoisted(() => {
       nextEvents = undefined;
       return events;
     },
+    queueReplies: (...replies: string[]) => {
+      queuedReplies.push(...replies);
+    },
+    takeNextReply: () => (
+      queuedReplies.length > 0
+        ? { value: queuedReplies.shift()! }
+        : undefined
+    ),
     failNextDelivery: () => {
       failNextPromptDelivery = true;
     },
@@ -87,6 +100,7 @@ const mockClaude = vi.hoisted(() => {
     reset: () => {
       prompts.length = 0;
       rawPrompts.length = 0;
+      promptSessionIds.length = 0;
       steers.length = 0;
       createCount = 0;
       activeModel = "sonnet";
@@ -96,11 +110,13 @@ const mockClaude = vi.hoisted(() => {
       promptGate = undefined;
       releasePromptGate = undefined;
       nextEvents = undefined;
+      queuedReplies.length = 0;
       failNextPromptDelivery = false;
       artifactFileName = undefined;
       createSession.mockReset();
       resumeSession.mockReset();
       getSessionInfo.mockReset();
+      compact.mockReset();
       dispose.mockReset();
     },
   };
@@ -230,6 +246,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
       const text = stripOutputFilesInstruction(rawText);
       mockClaude.prompts.push(text);
       mockClaude.rawPrompts.push(rawText);
+      mockClaude.promptSessionIds.push(options.sessionId);
       if (mockClaude.takeDeliveryFailure()) {
         throw new MockPromptNotDeliveredError(
           rawText,
@@ -267,11 +284,13 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
         }
         return;
       }
+      const queuedReply = mockClaude.takeNextReply();
+      const reply = queuedReply?.value ?? `mock reply to ${text}`;
       yield {
         type: "assistant_text_delta",
         sessionId: options.sessionId,
         jobId: options.jobId,
-        text: `mock reply to ${text}`,
+        text: reply,
       };
       yield {
         type: "usage_updated",
@@ -285,12 +304,16 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
         type: "assistant_message_complete",
         sessionId: options.sessionId,
         jobId: options.jobId,
-        text: `mock reply to ${text}`,
+        text: reply,
       };
     }
 
     async streamInput(_sessionId: string, input: { text?: string }) {
       mockClaude.steers.push(input.text ?? "");
+    }
+
+    async compact(sessionId: string, instructions?: string) {
+      mockClaude.compact(sessionId, instructions);
     }
 
     async getUsage() {
@@ -302,7 +325,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
     }
 
     async getContext() {
-      return { usedTokens: 3, contextWindow: 200000 };
+      return { usedTokens: 3, contextWindow: 200000, autoCompactWindow: 200000 };
     }
 
     async dispose(sessionId?: string) {
@@ -746,6 +769,68 @@ describe("Claude bot flow", () => {
     );
   });
 
+  it("creates a fresh Claude session from a generated handoff summary", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude original task"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to original task"));
+    await waitForAgentSessionsIdle(tempDir);
+    await bot.handleUpdate(textUpdate(2, "/backend sdk"));
+    mockClaude.queueReplies(
+      "HANDOFF SUMMARY WITH CURRENT STATE",
+      "Summary loaded.",
+    );
+
+    await bot.handleUpdate(textUpdate(3, "/newsummary"));
+
+    expect(mockClaude.createSession).toHaveBeenCalledTimes(2);
+    expect(mockClaude.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      workspace: "C:\\workspace",
+      displayName: expect.stringContaining("(summary)"),
+      metadata: expect.objectContaining({
+        model: "sonnet",
+        permissionMode: "acceptEdits",
+        backend: "sdk",
+      }),
+    }));
+    expect(mockClaude.prompts[1]).toContain(
+      "Create a compact handoff summary for continuing this Claude session in a fresh session.",
+    );
+    expect(mockClaude.prompts[2]).toContain("HANDOFF SUMMARY WITH CURRENT STATE");
+    expect(mockClaude.prompts[2]).toContain("Reply only: Summary loaded.");
+    expect(mockClaude.rawPrompts[1]).not.toContain("Output files: write any files");
+    expect(mockClaude.rawPrompts[2]).not.toContain("Output files: write any files");
+    expect(mockClaude.dispose).toHaveBeenCalledWith("claude-provider-1");
+    const completionMessage = sent
+      .map((entry) => entry.text ?? "")
+      .find((text) => text.includes("New Claude session created from summary."));
+    expect(completionMessage).toContain("Workspace: <code>C:\\workspace</code>");
+    expect(completionMessage).toContain("Model: <code>sonnet</code>");
+    expect(completionMessage).toContain("Backend: <code>sdk</code>");
+    expect(completionMessage).toContain("HANDOFF SUMMARY WITH CURRENT STATE");
+  });
+
+  it("keeps the original Claude session selected if the summary seed fails", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude original task"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to original task"));
+    await waitForAgentSessionsIdle(tempDir);
+    mockClaude.queueReplies("RECOVERABLE HANDOFF", "");
+
+    await bot.handleUpdate(textUpdate(2, "/newsummary"));
+
+    expect(sent.some((entry) =>
+      entry.text?.includes("Claude handoff generation returned empty text."),
+    )).toBe(true);
+    expect(mockClaude.dispose).toHaveBeenCalledWith("claude-provider-2");
+    expect(mockClaude.dispose).not.toHaveBeenCalledWith("claude-provider-1");
+
+    await bot.handleUpdate(textUpdate(3, "continue in original"));
+    await waitFor(() => mockClaude.prompts.includes("continue in original"));
+    expect(mockClaude.promptSessionIds.at(-1)).toBe("claude-provider-1");
+  });
+
   it("changes Claude model inside the active Claude runtime", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
@@ -1028,6 +1113,7 @@ describe("Claude bot flow", () => {
 
     await bot.handleUpdate(textUpdate(1, "/claude hello"));
     await waitFor(() => mockClaude.prompts.includes("hello"));
+    await waitForAgentSessionsIdle(tempDir);
 
     await bot.handleUpdate(textUpdate(2, "/backend"));
     expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude engine for this Telegram context: pty"))).toBeDefined();
@@ -1038,8 +1124,12 @@ describe("Claude bot flow", () => {
     await bot.handleUpdate(textUpdate(4, "/backend"));
     expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude engine for this Telegram context: sdk"))).toBeDefined();
 
-    await bot.handleUpdate(textUpdate(5, "/compact"));
-    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Compaction is automatic on the sdk engine"))).toBeDefined();
+    await bot.handleUpdate(textUpdate(5, "/compact preserve decisions and pending tests"));
+    expect(mockClaude.compact).toHaveBeenCalledWith(
+      expect.any(String),
+      "preserve decisions and pending tests",
+    );
+    expect(sent.map((entry) => entry.text).find((text) => text === "Claude compaction completed.")).toBeDefined();
   });
 
   it("reports Claude diagnostics through /doctor while Claude is active", async () => {
@@ -1167,6 +1257,7 @@ function createConfig(workspace: string): TeleCodeConfig {
     claudeLargeSessionResume: "summary",
     claudeTurnIdleTimeoutSeconds: 180,
     claudeContextWindow: 200000,
+    claudeAutoCompactWindow: 200000,
     claudeBackend: "pty",
   };
 }

@@ -177,7 +177,7 @@ export interface AgentProviderAdapter {
   abort?(sessionId: string, jobId?: string): Promise<void>;
   fork?(sessionId: string): Promise<AgentSessionDescriptor>;
   rename?(sessionId: string, displayName: string): Promise<AgentSessionDescriptor>;
-  compact?(sessionId: string): Promise<void>;
+  compact?(sessionId: string, instructions?: string): Promise<void>;
   getUsage?(sessionId: string): Promise<Record<string, unknown>>;
   getContext?(sessionId: string): Promise<Record<string, unknown>>;
   dispose?(sessionId?: string): Promise<void>;

@@ -109,7 +109,7 @@ export function renderHelpMessage(): DualText {
     {
       title: "Codex CLI",
       commands: [
-        ["/compact", "Compact the active Codex thread"],
+        ["/compact", "Compact the active Codex or Claude session"],
         ["/agents", "Forward to Codex"],
         ["/diff", "Forward to Codex"],
         ["/doctor", "Forward to Codex"],

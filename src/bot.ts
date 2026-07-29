@@ -181,9 +181,16 @@ const TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "progress",
   "voice",
   "mcp",
+  "newsummary",
 ]);
 const NEW_FROM_SUMMARY_PROMPT = [
   "Create a compact handoff summary for continuing this Codex session in a fresh thread.",
+  "Include: current goal, important decisions, files changed or inspected, commands run, current state, open problems, and recommended next steps.",
+  "Be specific enough that a new session can continue without reading the full transcript.",
+  "Output only the summary.",
+].join("\n");
+const CLAUDE_NEW_FROM_SUMMARY_PROMPT = [
+  "Create a compact handoff summary for continuing this Claude session in a fresh session.",
   "Include: current goal, important decisions, files changed or inspected, commands run, current state, open problems, and recommended next steps.",
   "Be specific enough that a new session can continue without reading the full transcript.",
   "Output only the summary.",
@@ -3383,7 +3390,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
 
       if (parsed.name === "compact") {
-        await compactClaudeSession(ctx, contextKey, messageThreadId);
+        await compactClaudeSession(ctx, contextKey, messageThreadId, parsed.argument);
         return true;
       }
 
@@ -3434,16 +3441,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     ctx: Context,
     contextKey: TelegramContextKey,
     messageThreadId?: number,
+    instructions?: string,
   ): Promise<void> => {
     if (!claudeAdapter) {
       const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
-      return;
-    }
-    if (getClaudeBackend(contextKey) === "sdk") {
-      // Manual compaction drives the interactive TUI; the SDK engine has no such
-      // control and compacts automatically. Surface that instead of faking it.
-      const message = "Compaction is automatic on the sdk engine. Use /backend pty first if you need a manual /compact.";
       await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
       return;
     }
@@ -3459,7 +3460,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         fallbackText: "Compacting Claude session...",
         messageThreadId,
       });
-      await claudeAdapter.compact?.(descriptor.id);
+      await claudeAdapter.compact?.(descriptor.id, instructions);
       const message = "Claude compaction completed.";
       await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
       persistClaudeSession(contextKey, descriptor);
@@ -3734,10 +3735,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const context = await claudeAdapter.getContext(descriptor.id);
       const used = Number(context.usedTokens ?? 0);
       const window = Number(context.contextWindow ?? config.claudeContextWindow);
-      const percent = window > 0 ? Math.round((used / window) * 100) : 0;
+      const autoCompactWindow = Number(
+        context.autoCompactWindow ?? config.claudeAutoCompactWindow,
+      );
       const sections = [
         report ?? "Could not read the Claude usage panel this time. Try again in a moment.",
-        `Session context: ${used} of ${window} tokens (${percent}%).`,
+        formatClaudeContextLine(used, window, autoCompactWindow)
+          .replace(/^Context:/u, "Session context:"),
       ];
       const plain = sections.join("\n\n");
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
@@ -3766,8 +3770,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const context = await claudeAdapter.getContext(descriptor.id);
     const used = Number(context.usedTokens ?? 0);
     const window = Number(context.contextWindow ?? config.claudeContextWindow);
+    const autoCompactWindow = Number(
+      context.autoCompactWindow ?? config.claudeAutoCompactWindow,
+    );
     const plain = [
-      formatClaudeContextLine(used, window),
+      formatClaudeContextLine(used, window, autoCompactWindow),
       `Last turn: in ${Number(usage.inputTokens ?? 0)}, cached ${Number(usage.cachedInputTokens ?? 0)}, out ${Number(usage.outputTokens ?? 0)}.`,
     ].join("\n");
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
@@ -6141,7 +6148,268 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     await handleWorkspaceShortcut(ctx, ctx.match[1] ?? "", next);
   });
 
+  const runClaudeHandoffTurn = async (
+    descriptor: AgentSessionDescriptor,
+    prompt: string,
+  ): Promise<{ descriptor: AgentSessionDescriptor; text: string }> => {
+    if (!claudeAdapter) {
+      throw new Error("Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.");
+    }
+
+    const jobId = `claude-handoff-${randomUUID().slice(0, 12)}`;
+    let streamedText = "";
+    let completedText = "";
+    let sawCompletion = false;
+    let providerError: string | undefined;
+
+    for await (const event of claudeAdapter.sendPrompt({
+      sessionId: descriptor.id,
+      jobId,
+      input: { text: prompt },
+    })) {
+      switch (event.type) {
+        case "assistant_text_delta":
+          streamedText += event.text;
+          break;
+        case "assistant_message_complete":
+          completedText = event.text;
+          sawCompletion = true;
+          break;
+        case "error":
+          providerError ??= event.message;
+          break;
+        default:
+          break;
+      }
+    }
+
+    if (providerError) {
+      throw new Error(providerError);
+    }
+    if (!sawCompletion) {
+      throw new Error("Claude provider ended the handoff turn without a completion event.");
+    }
+
+    const text = completedText.trim() || streamedText.trim();
+    if (!text) {
+      throw new Error("Claude handoff generation returned empty text.");
+    }
+
+    const refreshed = await claudeAdapter.getSessionInfo(descriptor.id);
+    return {
+      descriptor: {
+        ...refreshed,
+        displayName: descriptor.displayName ?? refreshed.displayName,
+      },
+      text,
+    };
+  };
+
+  const syncClaudeAgentSessionRecord = (
+    record: AgentSessionRecord,
+    descriptor: AgentSessionDescriptor,
+  ): AgentSessionRecord => {
+    let updated = record;
+    if (descriptor.providerSessionId && descriptor.providerSessionId !== updated.providerSessionId) {
+      updated = agentSessions.updateProviderSessionId(updated.id, descriptor.providerSessionId);
+    }
+    if (descriptor.displayName && descriptor.displayName !== updated.displayName) {
+      updated = agentSessions.updateDisplayName(updated.id, descriptor.displayName);
+    }
+    updated = agentSessions.updateMetadata(updated.id, descriptor.metadata);
+    persistAgentSessionState();
+    return updated;
+  };
+
+  const createClaudeNewFromSummary = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    rawWorkspace?: string,
+  ): Promise<void> => {
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot create a summary session while a prompt is running."), {
+        fallbackText: "Cannot create a summary session while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!claudeAdapter) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    const persisted = claudeState?.get(contextKey);
+    if (!claudeSessions.get(contextKey) && !persisted) {
+      const message = "No Claude session to summarize yet. Send Claude a message first.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    let sourceDescriptor: AgentSessionDescriptor;
+    try {
+      sourceDescriptor = await ensureClaudeSession(contextKey);
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+      return;
+    }
+
+    let targetWorkspace = sourceDescriptor.workspace;
+    const workspaceArg = rawWorkspace?.trim();
+    if (workspaceArg) {
+      const workspaces = [...new Set([sourceDescriptor.workspace, config.claudeWorkspace])];
+      const resolvedWorkspace = resolveWorkspaceArgument(workspaceArg, workspaces, config.claudeWorkspace);
+      if (!resolvedWorkspace) {
+        const message = `Unknown Claude workspace selection: ${workspaceArg}. Use a listed number, default, or a directory path.`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+      targetWorkspace = path.isAbsolute(resolvedWorkspace)
+        ? path.normalize(resolvedWorkspace)
+        : path.resolve(config.claudeWorkspace, resolvedWorkspace);
+      let validWorkspace = false;
+      try {
+        validWorkspace = existsSync(targetWorkspace) && statSync(targetWorkspace).isDirectory();
+      } catch {
+        validWorkspace = false;
+      }
+      if (!validWorkspace) {
+        const message = `Claude workspace does not exist or is not a directory: ${targetWorkspace}`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+    }
+
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    let sourceRecord: AgentSessionRecord | undefined;
+    let createdDescriptor: AgentSessionDescriptor | undefined;
+    let committed = false;
+    try {
+      sourceRecord = ensureAgentSessionRecord(contextKey, "claude", {
+        workspace: sourceDescriptor.workspace,
+        displayName: sourceDescriptor.displayName ?? "Claude Code",
+        providerSessionId: sourceDescriptor.providerSessionId,
+        select: true,
+        metadata: sourceDescriptor.metadata,
+      });
+      await safeReply(ctx, escapeHTML("Creating handoff summary..."), {
+        fallbackText: "Creating handoff summary...",
+      });
+      const summaryTurn = await runClaudeHandoffTurn(sourceDescriptor, CLAUDE_NEW_FROM_SUMMARY_PROMPT);
+      sourceDescriptor = summaryTurn.descriptor;
+      sourceRecord = syncClaudeAgentSessionRecord(sourceRecord, sourceDescriptor);
+      claudeSessions.set(contextKey, sourceDescriptor);
+      persistClaudeSession(contextKey, sourceDescriptor);
+      const summary = summaryTurn.text;
+
+      const startMessage = `Starting new Claude session from summary in ${targetWorkspace}...`;
+      await safeReply(ctx, escapeHTML(startMessage), {
+        fallbackText: startMessage,
+      });
+
+      const model = String(sourceDescriptor.metadata?.model ?? config.claudeDefaultModel);
+      const permissionMode = asClaudePermissionMode(sourceDescriptor.metadata?.permissionMode)
+        ?? config.claudePermissionMode;
+      const backend = claudeAdapter.getBackend(sourceDescriptor.id);
+      const sourceName = sourceDescriptor.displayName?.trim() || `TeleCode ${contextKey}`;
+      createdDescriptor = await claudeAdapter.createSession({
+        workspace: targetWorkspace,
+        displayName: `${sourceName} (summary)`,
+        metadata: {
+          model,
+          permissionMode,
+          backend,
+        },
+      });
+      // While the seed turn is running, /stop must target the new runtime. The
+      // persisted and selected session remain the source until the seed succeeds.
+      claudeSessions.set(contextKey, createdDescriptor);
+      const seedPrompt = [
+        "You are continuing from a previous Claude session.",
+        "Treat the following handoff summary as the starting context for this new session.",
+        "Do not redo work unless asked. Reply only: Summary loaded.",
+        "",
+        summary,
+      ].join("\n");
+      const seedTurn = await runClaudeHandoffTurn(createdDescriptor, seedPrompt);
+      createdDescriptor = seedTurn.descriptor;
+
+      const newRecord = ensureAgentSessionRecord(contextKey, "claude", {
+        workspace: createdDescriptor.workspace,
+        displayName: createdDescriptor.displayName ?? `${sourceName} (summary)`,
+        providerSessionId: createdDescriptor.providerSessionId,
+        select: true,
+        metadata: createdDescriptor.metadata,
+      });
+      claudeSessions.set(contextKey, createdDescriptor);
+      registry.setActiveProvider(contextKey, "claude");
+      persistClaudeSession(contextKey, createdDescriptor);
+      persistAgentSessionState();
+      lastAssistantReplyBySessionId.set(newRecord.id, seedTurn.text);
+      committed = true;
+
+      try {
+        await disposeClaudeDescriptor(sourceDescriptor);
+      } catch (disposeError) {
+        console.warn("Failed to dispose the previous Claude runtime after summary handoff", disposeError);
+      }
+
+      const plain = [
+        "New Claude session created from summary.",
+        `Workspace: ${createdDescriptor.workspace}`,
+        `Model: ${String(createdDescriptor.metadata?.model ?? model)}`,
+        `Backend: ${String(createdDescriptor.metadata?.backend ?? backend)}`,
+        "",
+        "Summary:",
+        summary,
+      ].join("\n");
+      const html = [
+        "<b>New Claude session created from summary.</b>",
+        `Workspace: <code>${escapeHTML(createdDescriptor.workspace)}</code>`,
+        `Model: <code>${escapeHTML(String(createdDescriptor.metadata?.model ?? model))}</code>`,
+        `Backend: <code>${escapeHTML(String(createdDescriptor.metadata?.backend ?? backend))}</code>`,
+        "",
+        "<b>Summary:</b>",
+        escapeHTML(summary),
+      ].join("\n");
+      await safeReply(ctx, html, { fallbackText: plain });
+    } catch (error) {
+      if (!committed && createdDescriptor) {
+        try {
+          await disposeClaudeDescriptor(createdDescriptor);
+        } catch (disposeError) {
+          console.warn("Failed to dispose incomplete Claude summary session", disposeError);
+        }
+      }
+      if (!committed) {
+        claudeSessions.set(contextKey, sourceDescriptor);
+        if (sourceRecord) {
+          agentSessions.selectSession(contextKey, sourceRecord.id);
+        }
+        persistAgentSessionState();
+        persistClaudeSession(contextKey, sourceDescriptor);
+      }
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  };
+
   const createNewFromSummary = async (ctx: Context, rawWorkspace?: string): Promise<void> => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (!rawContextKey) {
+      return;
+    }
+    if (isClaudeActive(rawContextKey)) {
+      await createClaudeNewFromSummary(ctx, rawContextKey, rawWorkspace);
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -6801,6 +7069,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
         return;
       }
+      const compactInstructions = ctx.message?.text
+        ?.replace(/^\/compact(?:@\w+)?(?:\s+|$)/iu, "")
+        .trim();
       if (!claudeAdapter) {
         const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
@@ -6817,7 +7088,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         await safeReply(ctx, escapeHTML("Compacting Claude session..."), {
           fallbackText: "Compacting Claude session...",
         });
-        await claudeAdapter.compact?.(descriptor.id);
+        await claudeAdapter.compact?.(descriptor.id, compactInstructions);
         const message = "Claude compaction completed.";
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
         persistClaudeSession(rawContextKey, descriptor);
@@ -7707,7 +7978,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "follow", description: "Switch to a child session" },
     { command: "parent", description: "Return from child session" },
     { command: "use", description: "Switch provider session" },
-    { command: "compact", description: "Ask Codex to compact this thread" },
+    { command: "compact", description: "Compact the active Codex or Claude session" },
     { command: "clear", description: "Forget this Telegram context" },
     { command: "copy", description: "Re-send last assistant reply" },
     { command: "retry", description: "Resend the last prompt" },
@@ -7768,6 +8039,7 @@ function renderClaudeSessionPlain(
 ): string {
   const used = Number(context?.usedTokens ?? 0);
   const window = Number(context?.contextWindow ?? 0);
+  const autoCompactWindow = Number(context?.autoCompactWindow ?? 0);
   return [
     "Claude session:",
     `Session UUID: ${descriptor.providerSessionId ?? "(unknown)"}`,
@@ -7776,7 +8048,7 @@ function renderClaudeSessionPlain(
     `Permission mode: ${String(descriptor.metadata?.permissionMode ?? "(default)")}`,
     `Engine: ${String(descriptor.metadata?.backend ?? "pty")}`,
     `Status: ${descriptor.status}`,
-    window > 0 ? formatClaudeContextLine(used, window) : undefined,
+    window > 0 ? formatClaudeContextLine(used, window, autoCompactWindow) : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
@@ -7784,12 +8056,19 @@ function renderClaudeSessionPlain(
 
 // A configured CLAUDE_CONTEXT_WINDOW is only a default; models like Fable have larger
 // windows, and reporting "114%" of the wrong denominator reads as impossible (it was).
-export function formatClaudeContextLine(used: number, window: number): string {
+export function formatClaudeContextLine(
+  used: number,
+  window: number,
+  autoCompactWindow?: number,
+): string {
+  const compactSuffix = autoCompactWindow && autoCompactWindow > 0
+    ? ` Auto-compaction window: ${autoCompactWindow} tokens.`
+    : "";
   if (window > 0 && used > window) {
-    return `Context: ${used} tokens used. That exceeds the configured ${window}-token window, so this model's real window is larger and no reliable percentage exists. Set CLAUDE_CONTEXT_WINDOW to this model's window for accurate percentages.`;
+    return `Context: ${used} tokens used. That exceeds the configured ${window}-token window, so this model's real window is larger and no reliable percentage exists. Set CLAUDE_CONTEXT_WINDOW to this model's window for accurate percentages.${compactSuffix}`;
   }
   const percent = window > 0 ? Math.round((used / window) * 100) : 0;
-  return `Context: ${used} of ${window} tokens (${percent}%).`;
+  return `Context: ${used} of ${window} tokens (${percent}%).${compactSuffix}`;
 }
 
 function renderAppServerProbePlain(result: AppServerProbeResult): string {

@@ -19,6 +19,8 @@ export interface ClaudePtySpawnOptions {
   cwd: string;
   /** Isolated CLAUDE_CONFIG_DIR so the child does not load the user-scoped telegram plugin. */
   configDir?: string;
+  /** Effective window Claude Code uses when deciding when to auto-compact. */
+  autoCompactWindow?: number;
   cols?: number;
   rows?: number;
 }
@@ -44,17 +46,7 @@ export class ClaudePty extends EventEmitter {
       throw new Error("Claude PTY is already spawned");
     }
 
-    const env: Record<string, string> = { ...(process.env as Record<string, string>) };
-    for (const key of Object.keys(env)) {
-      if (key === "CLAUDECODE" || key.startsWith("CLAUDE_CODE_")) {
-        delete env[key];
-      }
-    }
-    if (options.configDir) {
-      env.CLAUDE_CONFIG_DIR = options.configDir;
-    } else {
-      delete env.CLAUDE_CONFIG_DIR;
-    }
+    const env = buildClaudePtyEnv(options);
 
     this.proc = pty.spawn(options.bin, options.args, {
       cwd: options.cwd,
@@ -313,6 +305,36 @@ export class ClaudePty extends EventEmitter {
     }
     return this.proc;
   }
+}
+
+export function buildClaudePtyEnv(
+  options: ClaudePtySpawnOptions,
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(sourceEnv)) {
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+  for (const key of Object.keys(env)) {
+    if (key === "CLAUDECODE" || key.startsWith("CLAUDE_CODE_")) {
+      delete env[key];
+    }
+  }
+  if (
+    options.autoCompactWindow !== undefined &&
+    Number.isSafeInteger(options.autoCompactWindow) &&
+    options.autoCompactWindow > 0
+  ) {
+    env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(options.autoCompactWindow);
+  }
+  if (options.configDir) {
+    env.CLAUDE_CONFIG_DIR = options.configDir;
+  } else {
+    delete env.CLAUDE_CONFIG_DIR;
+  }
+  return env;
 }
 
 export const CLAUDE_TRUST_MARKERS = [/trustthisfolder/];

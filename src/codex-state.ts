@@ -77,11 +77,18 @@ type ParentThreadRow = ThreadRow & {
   spawn_status: unknown;
 };
 
+type SessionFileCacheEntry = {
+  modifiedAtMs: number;
+  size: number;
+  thread: CodexThreadRecord | null;
+};
+
 const betterSqlite3Module = await import("better-sqlite3").catch(() => null);
 const BetterSqlite3 = (
   (betterSqlite3Module as { default?: DatabaseCtor } | null)?.default ??
   (betterSqlite3Module as DatabaseCtor | null)
 ) as DatabaseCtor | null;
+const sessionFileCache = new Map<string, SessionFileCacheEntry>();
 
 export function findLatestDatabase(): string | null {
   const codexDir = getCodexDir();
@@ -108,7 +115,7 @@ export function findLatestDatabase(): string | null {
 }
 
 export function listThreads(limit = 20): CodexThreadRecord[] {
-  return withDatabase((db) => {
+  const databaseThreads = withDatabase((db) => {
     const query = db.prepare(`
       SELECT id, title, cwd, model, created_at, updated_at, first_user_message
       FROM threads
@@ -120,10 +127,12 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
     const rows = query.all(limit) as ThreadRow[];
     return rows.map(mapThreadRow);
   }) ?? [];
+
+  return mergeThreadRecords(databaseThreads, listSessionFileThreads()).slice(0, Math.max(1, limit));
 }
 
 export function getThread(id: string): CodexThreadRecord | null {
-  return (
+  const databaseThread = (
     withDatabase((db) => {
       const query = db.prepare(`
         SELECT id, title, cwd, model, created_at, updated_at, first_user_message
@@ -136,6 +145,7 @@ export function getThread(id: string): CodexThreadRecord | null {
       return row ? mapThreadRow(row) : null;
     }) ?? null
   );
+  return databaseThread ?? listSessionFileThreads().find((thread) => thread.id === id) ?? null;
 }
 
 export function getThreadByPrefix(idPrefix: string): CodexThreadRecord | null {
@@ -144,8 +154,7 @@ export function getThreadByPrefix(idPrefix: string): CodexThreadRecord | null {
     return null;
   }
 
-  return (
-    withDatabase((db) => {
+  const databaseMatches = withDatabase((db) => {
       const query = db.prepare(`
         SELECT id, title, cwd, model, created_at, updated_at, first_user_message
         FROM threads
@@ -155,9 +164,13 @@ export function getThreadByPrefix(idPrefix: string): CodexThreadRecord | null {
       `);
 
       const rows = query.all(`${normalized}%`) as ThreadRow[];
-      return rows.length === 1 ? mapThreadRow(rows[0]!) : null;
-    }) ?? null
+      return rows.map(mapThreadRow);
+    }) ?? [];
+  const matches = mergeThreadRecords(
+    databaseMatches,
+    listSessionFileThreads().filter((thread) => thread.id.startsWith(normalized)),
   );
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 export function listChildThreads(parentThreadId: string): CodexChildThreadRecord[] {
@@ -250,7 +263,7 @@ export function readThreadHistory(threadId: string, limit = 10): CodexHistoryMes
 }
 
 export function listWorkspaces(): string[] {
-  return (
+  const databaseWorkspaces = (
     withDatabase((db) => {
       const query = db.prepare(`
         SELECT DISTINCT cwd
@@ -265,6 +278,142 @@ export function listWorkspaces(): string[] {
         .filter(Boolean);
     }) ?? []
   );
+  return [...new Set([
+    ...databaseWorkspaces,
+    ...listSessionFileThreads().map((thread) => thread.cwd).filter(Boolean),
+  ])].sort();
+}
+
+export function listSessionFileThreads(): CodexThreadRecord[] {
+  const codexDir = getCodexDir();
+  if (!codexDir) {
+    return [];
+  }
+
+  const roots = [
+    path.join(codexDir, "sessions"),
+    path.join(codexDir, "archived_sessions"),
+  ].filter((directory) => existsSync(directory));
+  const seenFiles = new Set<string>();
+  const threads: CodexThreadRecord[] = [];
+
+  for (const root of roots) {
+    try {
+      for (const sessionPath of walkFiles(root).filter((file) => file.endsWith(".jsonl"))) {
+        seenFiles.add(sessionPath);
+        try {
+          const stats = statSync(sessionPath);
+          const cached = sessionFileCache.get(sessionPath);
+          let thread = cached?.modifiedAtMs === stats.mtimeMs && cached.size === stats.size
+            ? cached.thread
+            : undefined;
+          if (thread === undefined) {
+            thread = parseSessionFileThread(
+              sessionPath,
+              readFileSync(sessionPath, "utf8"),
+              stats.mtimeMs,
+            );
+            sessionFileCache.set(sessionPath, {
+              modifiedAtMs: stats.mtimeMs,
+              size: stats.size,
+              thread,
+            });
+          }
+          if (thread) {
+            threads.push(thread);
+          }
+        } catch {
+          // A single partially-written or inaccessible transcript must not hide other sessions.
+        }
+      }
+    } catch {
+      // Ignore a missing or unreadable archive root.
+    }
+  }
+
+  for (const cachedPath of sessionFileCache.keys()) {
+    if (!seenFiles.has(cachedPath)) {
+      sessionFileCache.delete(cachedPath);
+    }
+  }
+
+  return mergeThreadRecords([], threads);
+}
+
+export function parseSessionFileThread(
+  sessionPath: string,
+  contents: string,
+  modifiedAtMs = 0,
+): CodexThreadRecord | null {
+  let id = sessionIdFromFilename(sessionPath);
+  let cwd = "";
+  let model: string | null = null;
+  let firstUserMessage = "";
+  let createdAtMs = Number.POSITIVE_INFINITY;
+  let updatedAtMs = modifiedAtMs;
+
+  for (const line of contents.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    try {
+      const entry = JSON.parse(line) as {
+        timestamp?: unknown;
+        type?: unknown;
+        payload?: unknown;
+      };
+      const timestampMs = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : Number.NaN;
+      if (Number.isFinite(timestampMs)) {
+        createdAtMs = Math.min(createdAtMs, timestampMs);
+        updatedAtMs = Math.max(updatedAtMs, timestampMs);
+      }
+      if (!entry.payload || typeof entry.payload !== "object") {
+        continue;
+      }
+
+      const payload = entry.payload as Record<string, unknown>;
+      if (entry.type === "session_meta") {
+        id = stringValue(payload.id) || stringValue(payload.session_id) || id;
+        cwd = stringValue(payload.cwd) || cwd;
+        const sessionTimestampMs = Date.parse(stringValue(payload.timestamp));
+        if (Number.isFinite(sessionTimestampMs)) {
+          createdAtMs = Math.min(createdAtMs, sessionTimestampMs);
+        }
+      } else if (entry.type === "turn_context") {
+        cwd = stringValue(payload.cwd) || cwd;
+        model = stringValue(payload.model) || model;
+      } else if (
+        entry.type === "event_msg" &&
+        payload.type === "user_message" &&
+        !firstUserMessage
+      ) {
+        firstUserMessage = stringValue(payload.message).trim();
+      }
+    } catch {
+      // Ignore an incomplete trailing JSONL line while Codex is still writing.
+    }
+  }
+
+  if (!id) {
+    return null;
+  }
+  if (!Number.isFinite(createdAtMs)) {
+    createdAtMs = modifiedAtMs;
+  }
+  if (!Number.isFinite(updatedAtMs) || updatedAtMs <= 0) {
+    updatedAtMs = createdAtMs;
+  }
+
+  return {
+    id,
+    title: "",
+    cwd,
+    model,
+    createdAt: new Date(Math.max(0, createdAtMs)),
+    updatedAt: new Date(Math.max(0, updatedAtMs)),
+    firstUserMessage,
+  };
 }
 
 export function listModels(): CodexModelRecord[] {
@@ -303,6 +452,59 @@ function mapThreadRow(row: ThreadRow): CodexThreadRecord {
     updatedAt: fromUnixSeconds(row.updated_at),
     firstUserMessage: typeof row.first_user_message === "string" ? row.first_user_message : "",
   };
+}
+
+function mergeThreadRecords(
+  databaseThreads: CodexThreadRecord[],
+  sessionFileThreads: CodexThreadRecord[],
+): CodexThreadRecord[] {
+  const byId = new Map<string, CodexThreadRecord>();
+  for (const thread of sessionFileThreads) {
+    byId.set(thread.id, thread);
+  }
+  for (const thread of databaseThreads) {
+    const fallback = byId.get(thread.id);
+    byId.set(thread.id, {
+      ...thread,
+      title: thread.title || fallback?.title || "",
+      cwd: thread.cwd || fallback?.cwd || "",
+      model: thread.model || fallback?.model || null,
+      firstUserMessage: thread.firstUserMessage || fallback?.firstUserMessage || "",
+      createdAt: earlierDate(thread.createdAt, fallback?.createdAt),
+      updatedAt: laterDate(thread.updatedAt, fallback?.updatedAt),
+    });
+  }
+  return [...byId.values()].sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime());
+}
+
+function earlierDate(primary: Date, fallback?: Date): Date {
+  if (!fallback || !Number.isFinite(fallback.getTime())) {
+    return primary;
+  }
+  if (!Number.isFinite(primary.getTime())) {
+    return fallback;
+  }
+  return primary.getTime() <= fallback.getTime() ? primary : fallback;
+}
+
+function laterDate(primary: Date, fallback?: Date): Date {
+  if (!fallback || !Number.isFinite(fallback.getTime())) {
+    return primary;
+  }
+  if (!Number.isFinite(primary.getTime())) {
+    return fallback;
+  }
+  return primary.getTime() >= fallback.getTime() ? primary : fallback;
+}
+
+function sessionIdFromFilename(sessionPath: string): string {
+  return path.basename(sessionPath).match(
+    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$/i,
+  )?.[1] ?? "";
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 function fromUnixSeconds(value: unknown): Date {

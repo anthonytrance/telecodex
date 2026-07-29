@@ -219,6 +219,50 @@ describe("codex-state", () => {
     expect(state.listThreads()).toEqual([]);
   });
 
+  it("parses a Codex JSONL session when the SQLite index is unavailable", async () => {
+    const state = await loadCodexState({ betterSqliteAvailable: false });
+    const record = state.parseSessionFileThread(
+      "/Users/tester/.codex/sessions/2026/07/rollout-2026-07-29T01-02-03-019fab0f-358c-78e2-b02d-4625104e7831.jsonl",
+      [
+        JSON.stringify({
+          timestamp: "2026-07-29T01:02:03.000Z",
+          type: "session_meta",
+          payload: {
+            id: "019fab0f-358c-78e2-b02d-4625104e7831",
+            cwd: "/workspace/old",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-07-29T01:02:04.000Z",
+          type: "turn_context",
+          payload: {
+            cwd: "/workspace/current",
+            model: "gpt-5.6-terra",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-07-29T01:02:05.000Z",
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "Restore every previous session",
+          },
+        }),
+      ].join("\n"),
+      Date.parse("2026-07-29T01:02:06.000Z"),
+    );
+
+    expect(record).toEqual({
+      id: "019fab0f-358c-78e2-b02d-4625104e7831",
+      title: "",
+      cwd: "/workspace/current",
+      model: "gpt-5.6-terra",
+      createdAt: new Date("2026-07-29T01:02:03.000Z"),
+      updatedAt: new Date("2026-07-29T01:02:06.000Z"),
+      firstUserMessage: "Restore every previous session",
+    });
+  });
+
   it("listThreads returns mapped active thread records", async () => {
     const state = await loadCodexState({
       files: ["state_main.sqlite"],

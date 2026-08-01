@@ -89,10 +89,16 @@ function syncCredentials(configDir: string, sourceConfigDir: string): void {
   if (!existsSync(source)) {
     return;
   }
+  // Never seed or refresh from a wiped/expired credential blob. Claude Code has
+  // been observed writing empty access/refresh tokens after a failed refresh; if
+  // we copy that into the isolated dir we destroy any still-usable local copy.
+  if (!hasUsableClaudeCredentials(source)) {
+    return;
+  }
   const dest = path.join(configDir, ".credentials.json");
-  // Copy when the isolated dir has no creds yet, or when the canonical creds are
-  // fresher than the copy (the live session refreshes its OAuth token periodically).
-  if (destIsAtLeastAsFresh(source, dest)) {
+  // Copy when the isolated dir has no usable creds yet, or when the canonical
+  // creds are fresher than the copy (the live session refreshes OAuth tokens).
+  if (destHasUsableCredentials(dest) && destIsAtLeastAsFresh(source, dest)) {
     return;
   }
   copyFileSync(source, dest);
@@ -104,6 +110,34 @@ function destIsAtLeastAsFresh(source: string, dest: string): boolean {
   }
   try {
     return statSync(dest).mtimeMs >= statSync(source).mtimeMs;
+  } catch {
+    return false;
+  }
+}
+
+function destHasUsableCredentials(dest: string): boolean {
+  return existsSync(dest) && hasUsableClaudeCredentials(dest);
+}
+
+/** True when the credentials file has a non-empty access or refresh token. */
+export function hasUsableClaudeCredentials(credentialsPath: string): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(credentialsPath, "utf8")) as {
+      claudeAiOauth?: {
+        accessToken?: unknown;
+        refreshToken?: unknown;
+      };
+      // Older/test fixtures may store a bare token field.
+      token?: unknown;
+    };
+    const oauth = raw.claudeAiOauth;
+    const access = typeof oauth?.accessToken === "string" ? oauth.accessToken.trim() : "";
+    const refresh = typeof oauth?.refreshToken === "string" ? oauth.refreshToken.trim() : "";
+    if (access.length > 0 || refresh.length > 0) {
+      return true;
+    }
+    const bare = typeof raw.token === "string" ? raw.token.trim() : "";
+    return bare.length > 0;
   } catch {
     return false;
   }

@@ -54,6 +54,34 @@ describe("ensureClaudeConfigDir", () => {
     expect(existsSync(path.join(target, ".credentials.json"))).toBe(false);
   });
 
+  it("does not overwrite usable isolated credentials with empty canonical tokens", () => {
+    ensureClaudeConfigDir(target, source);
+    const dest = path.join(target, ".credentials.json");
+    writeFileSync(dest, JSON.stringify({ claudeAiOauth: { accessToken: "still-good", refreshToken: "refresh" } }));
+    const older = new Date(Date.now() - 60_000);
+    utimesSync(dest, older, older);
+
+    // Canonical file is newer but wiped — a failed OAuth refresh can look like this.
+    writeFileSync(
+      path.join(source, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "", expiresAt: 0 } }),
+    );
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(path.join(source, ".credentials.json"), future, future);
+
+    ensureClaudeConfigDir(target, source);
+    expect(readFileSync(dest, "utf8")).toContain("still-good");
+  });
+
+  it("does not seed the isolated dir from empty canonical credentials", () => {
+    writeFileSync(
+      path.join(source, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "" } }),
+    );
+    ensureClaudeConfigDir(target, source);
+    expect(existsSync(path.join(target, ".credentials.json"))).toBe(false);
+  });
+
   it("seeds hasCompletedOnboarding so the first-run wizard is skipped", () => {
     ensureClaudeConfigDir(target, source);
     const claudeJson = JSON.parse(readFileSync(path.join(target, ".claude.json"), "utf8"));

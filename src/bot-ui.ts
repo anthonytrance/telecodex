@@ -66,6 +66,8 @@ export function renderHelpMessage(): DualText {
         ["/abort", "Cancel current operation"],
         ["/stop", "Alias for /abort"],
         ["/steer <text>", "Steer active app-server turn"],
+        ["s", "Steer the message you just queued into the running turn (/qsteer)"],
+        ["d", "Drop the message you just queued (/qdrop)"],
         ["/retry", "Resend the last prompt"],
         ["/goal", "Show native goal status"],
         ["/goal <task>", "Start native goal mode"],
@@ -91,8 +93,8 @@ export function renderHelpMessage(): DualText {
     {
       title: "🔐 Auth",
       commands: [
-        ["/auth", "Check auth status"],
-        ["/login", "Start authentication"],
+        ["/auth", "Check auth status (Claude status in a Claude lane)"],
+        ["/login", "Start authentication (Claude login in a Claude lane)"],
         ["/claude_login", "Start Claude Code login"],
         ["/logout", "Sign out"],
       ],

@@ -349,6 +349,44 @@ vi.mock("../src/startup-safety.js", () => ({
   findRunningClaudeTelegramPluginProcesses: vi.fn(async () => []),
 }));
 
+// The login flow is the only pty.spawn in bot.ts, so a stub is enough to prove
+// /login reaches it instead of being blocked in a Claude lane.
+const mockPty = vi.hoisted(() => {
+  const spawns: Array<{ file: string; args: string[] }> = [];
+  const writes: string[] = [];
+  let emit: ((data: string) => void) | undefined;
+  return {
+    spawns,
+    writes,
+    emitData: (data: string) => emit?.(data),
+    setEmitter: (listener: (data: string) => void) => {
+      emit = listener;
+    },
+    reset: () => {
+      spawns.length = 0;
+      writes.length = 0;
+      emit = undefined;
+    },
+  };
+});
+
+vi.mock("node-pty", () => ({
+  spawn: (file: string, args: string[]) => {
+    mockPty.spawns.push({ file, args });
+    return {
+      onData: (listener: (data: string) => void) => {
+        mockPty.setEmitter(listener);
+        return { dispose: () => {} };
+      },
+      onExit: () => ({ dispose: () => {} }),
+      write: (data: string) => {
+        mockPty.writes.push(data);
+      },
+      kill: () => {},
+    };
+  },
+}));
+
 import { createBot } from "../src/bot.js";
 
 describe("Claude bot flow", () => {
@@ -357,6 +395,7 @@ describe("Claude bot flow", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(path.join(tmpdir(), "telecode-bot-claude-"));
     mockClaude.reset();
+    mockPty.reset();
   });
 
   afterEach(() => {
@@ -663,17 +702,124 @@ describe("Claude bot flow", () => {
     expect(mockClaude.prompts).toEqual(["first task"]);
     await Promise.all([first, second, third]);
 
+    const queueHint = "Send s to steer it into the running turn, d to drop it, or nothing to leave it queued. /stop aborts the running turn.";
     expect(sent.map((entry) => entry.text)).toContain(
-      "Claude is still working. I queued this Claude message and will run it next. Use /stop if the current task is stuck.",
+      `Claude is still working. I queued this Claude message and will run it next.\n${queueHint}`,
     );
     expect(sent.map((entry) => entry.text)).toContain(
-      "Claude is still working. I queued this Claude message as item #2. Use /stop if the current task is stuck.",
+      `Claude is still working. I queued this Claude message as item #2.\n${queueHint}`,
     );
 
     mockClaude.releaseBlockedPrompt();
     await waitFor(() => mockClaude.prompts.length === 3);
 
     expect(mockClaude.prompts).toEqual(["first task", "second task", "third task"]);
+  });
+
+  it("starts the Claude login flow from /login instead of blocking it", async () => {
+    // A bare binary name keeps the existence check happy; node-pty is stubbed above.
+    const { bot, sent, registry } = await createTestBot(tempDir, { claudeBin: "claude" });
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "/login"));
+    await waitFor(() => mockPty.spawns.length === 1);
+
+    expect(mockPty.spawns[0]).toEqual({ file: "claude", args: ["auth", "login", "--claudeai"] });
+    expect(sent.map((entry) => entry.text)).toContain(
+      "Claude login started. Waiting for the browser login URL...",
+    );
+    expect(sent.map((entry) => entry.text ?? "").join("\n")).not.toContain("blocked from Telegram");
+
+    mockPty.emitData("Browse to https://claude.com/cai/oauth/authorize?state=abc123\r\nPaste code here:");
+    await waitFor(() =>
+      sent.some((entry) => entry.text?.includes("https://claude.com/cai/oauth/authorize?state=abc123")),
+    );
+
+    // Drop the lane so the 10 minute login timeout does not outlive the test.
+    registry.remove("123");
+  });
+
+  it("steers a queued Claude message into the running turn on s", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.blockNextPrompt();
+
+    await bot.handleUpdate(textUpdate(1, "/claude long task"));
+    await waitFor(() => mockClaude.prompts.includes("long task"));
+    await bot.handleUpdate(textUpdate(2, "actually use the venv python"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Send s to steer it")));
+
+    await bot.handleUpdate(textUpdate(3, "s"));
+    await waitFor(() => mockClaude.steers.includes("actually use the venv python"));
+    expect(sent.map((entry) => entry.text)).toContain("Steer sent to the active Claude turn.");
+
+    mockClaude.releaseBlockedPrompt();
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to long task"));
+
+    // The steered message must not also run as a queued follow-up turn.
+    expect(mockClaude.prompts).toEqual(["long task"]);
+  });
+
+  it("drops a queued Claude message on d and passes a bare d through when nothing is queued", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.blockNextPrompt();
+
+    await bot.handleUpdate(textUpdate(1, "/claude long task"));
+    await waitFor(() => mockClaude.prompts.includes("long task"));
+    await bot.handleUpdate(textUpdate(2, "oops wrong chat"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Send s to steer it")));
+
+    await bot.handleUpdate(textUpdate(3, "d"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Dropped the queued message")));
+
+    mockClaude.releaseBlockedPrompt();
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to long task"));
+    await waitForAgentSessionsIdle(tempDir);
+    expect(mockClaude.prompts).toEqual(["long task"]);
+    expect(mockClaude.steers).toEqual([]);
+
+    // Nothing queued anymore: a literal d is an ordinary prompt.
+    await bot.handleUpdate(textUpdate(4, "d"));
+    await waitFor(() => mockClaude.prompts.includes("d"));
+  });
+
+  it("keeps the s/d offer pointed at the newest queued message", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.blockNextPrompt();
+
+    await bot.handleUpdate(textUpdate(1, "/claude long task"));
+    await waitFor(() => mockClaude.prompts.includes("long task"));
+    await bot.handleUpdate(textUpdate(2, "first follow-up"));
+    await bot.handleUpdate(textUpdate(3, "second follow-up"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("as item #2")));
+
+    await bot.handleUpdate(textUpdate(4, "d"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Dropped the queued message")));
+
+    mockClaude.releaseBlockedPrompt();
+    await waitFor(() => mockClaude.prompts.includes("first follow-up"));
+    await waitForAgentSessionsIdle(tempDir);
+    expect(mockClaude.prompts).toEqual(["long task", "first follow-up"]);
+  });
+
+  it("steers a queued Claude message with /qsteer and reports when nothing is queued", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/qsteer"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("No queued message to steer")));
+
+    mockClaude.blockNextPrompt();
+    await bot.handleUpdate(textUpdate(2, "/claude long task"));
+    await waitFor(() => mockClaude.prompts.includes("long task"));
+    await bot.handleUpdate(textUpdate(3, "check the logs too"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Send s to steer it")));
+
+    await bot.handleUpdate(textUpdate(4, "/qsteer"));
+    await waitFor(() => mockClaude.steers.includes("check the logs too"));
+
+    mockClaude.releaseBlockedPrompt();
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to long task"));
+    await waitForAgentSessionsIdle(tempDir);
+    expect(mockClaude.prompts).toEqual(["long task"]);
   });
 
   it("rejects embedded slash commands before they are pasted into Claude", async () => {

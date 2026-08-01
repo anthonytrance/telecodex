@@ -65,6 +65,22 @@ export class ClaudePromptQueue {
     return this.entries.find((entry) => entry.contextKey === contextKey);
   }
 
+  /** Look up a still-queued entry by id. Returns undefined once it has been dispatched. */
+  get(id: string): ClaudePromptQueueEntry | undefined {
+    return this.entries.find((entry) => entry.id === id);
+  }
+
+  /** Pull one entry out by id, wherever it sits in the queue. */
+  remove(id: string): ClaudePromptQueueEntry | undefined {
+    const index = this.entries.findIndex((entry) => entry.id === id);
+    if (index === -1) {
+      return undefined;
+    }
+    const [entry] = this.entries.splice(index, 1);
+    this.save();
+    return entry;
+  }
+
   depth(contextKey: TelegramContextKey): number {
     return this.entries.filter((entry) => entry.contextKey === contextKey).length;
   }

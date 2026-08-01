@@ -113,8 +113,10 @@ const CLAUDE_COMMAND_SPECS = [
   spec("reload-*", "na", "Reloading host resources is not managed from Telegram."),
   spec("fast", "na", "Host speed toggles do not apply over Telegram."),
 
-  spec("login", "block", "Claude authentication changes are blocked from Telegram."),
-  spec("logout", "block", "Claude authentication changes are blocked from Telegram."),
+  // Login must stay reachable from Telegram: when the OAuth token dies, Telegram is
+  // the only way back in, and blocking it strands the bridge with no recovery path.
+  spec("login", "emulate", "Start the Claude subscription login flow through TeleCode."),
+  spec("logout", "block", "Claude logout is blocked from Telegram. Use /login to re-authenticate."),
   spec("upgrade", "block", "Subscription changes are blocked from Telegram."),
   spec("usage-credits", "block", "Usage credit changes are blocked from Telegram."),
   spec("feedback", "block", "Feedback would send data externally and needs a dedicated confirmation flow."),

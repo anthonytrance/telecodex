@@ -18,6 +18,12 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
     message: "Rate limited by the API. Wait a moment and try again.",
   },
   {
+    // A dead OAuth token reads as a refresh failure, not a 401, so it needs its own
+    // pattern to surface the one command that can repair it from Telegram.
+    pattern: /invalid_grant|refresh.?token|oauth.*(expired|invalid|revoked)|token.*(expired|revoked)/i,
+    message: "Authentication expired. Use /login to sign in again from Telegram.",
+  },
+  {
     pattern: /401|unauthorized|authentication|invalid.*api.?key/i,
     message: "Authentication failed. Use /login to re-authenticate or check your API key.",
   },

@@ -16,6 +16,11 @@ describe("Claude command registry", () => {
     expect(getClaudeCommandSpec("usage-credits")).toMatchObject({ class: "block" });
   });
 
+  it("keeps /login reachable so a dead token can be repaired from Telegram", () => {
+    expect(getClaudeCommandSpec("login")).toMatchObject({ class: "emulate" });
+    expect(getClaudeCommandSpec("logout")).toMatchObject({ class: "block" });
+  });
+
   it("normalizes aliases and underscore variants", () => {
     expect(getClaudeCommandSpec("abort")).toMatchObject({ name: "stop", class: "emulate" });
     expect(getClaudeCommandSpec("bg")).toMatchObject({ name: "background", class: "emulate" });

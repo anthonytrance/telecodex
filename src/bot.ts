@@ -132,6 +132,10 @@ const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
 const CLAUDE_QUIET_WARNING_PREFIX = "Claude has been quiet for ";
 // How long an unanswered idle-steer y/n question stays valid.
 const IDLE_STEER_CONFIRM_TTL_MS = 5 * 60 * 1000;
+// Offered every time a message is parked in a provider queue. A message sent by
+// accident mid-turn is otherwise unrecoverable: it just runs later, unasked.
+const QUEUED_PROMPT_ACTION_HINT =
+  "Send s to steer it into the running turn, d to drop it, or nothing to leave it queued. /stop aborts the running turn.";
 const MAX_CLAUDE_PROMPT_DELIVERY_FAILURES = 3;
 const NATIVE_CODEX_COMMANDS = [
   "compact",
@@ -159,6 +163,10 @@ const TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "abort",
   "stop",
   "steer",
+  "qsteer",
+  "qs",
+  "qdrop",
+  "qd",
   "claude",
   "claude-login",
   "claudelogin",
@@ -367,6 +375,30 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     provider: "claude" | "codex";
     expiresAt: number;
   }>();
+  // The message most recently parked in a provider queue for this lane, so a bare
+  // s/d can still reach it. Dropped as soon as the queued message starts running,
+  // which is also what makes a literal "s" pass through the rest of the time.
+  const pendingQueuedPrompts = new Map<TelegramContextKey, {
+    provider: "claude" | "codex";
+    /** Queue entry id; Claude keeps a real FIFO, Codex keeps a single slot. */
+    claudeEntryId?: string;
+    text: CodexPromptInput;
+  }>();
+  /**
+   * Retire the s/d offer once the queued message is no longer waiting. Passing an
+   * entry id keeps a newer queued message's offer alive when an older one starts.
+   */
+  const clearQueuedPromptAction = (contextKey: TelegramContextKey, claudeEntryId?: string): void => {
+    const pending = pendingQueuedPrompts.get(contextKey);
+    if (!pending) {
+      return;
+    }
+    if (claudeEntryId && pending.claudeEntryId && pending.claudeEntryId !== claudeEntryId) {
+      return;
+    }
+    pendingQueuedPrompts.delete(contextKey);
+  };
+
   const activeProgressRefreshers = new Map<TelegramContextKey, () => Promise<void>>();
   const pendingClaudeLogins = new Map<TelegramContextKey, PendingClaudeLogin>();
   const claudeAdapter = config.enableClaudeProvider ? new ClaudeProviderAdapter(config) : undefined;
@@ -459,6 +491,40 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         resolve(output.trim() || "Claude auth status returned no output.");
       });
     });
+  };
+
+  /**
+   * Summarize `claude auth status` for Telegram. The CLI prints JSON, which is noise
+   * for a screen reader, so flatten the fields that decide whether turns will run.
+   */
+  const readClaudeAuthSummary = async (): Promise<{ loggedIn: boolean; lines: string[] }> => {
+    const raw = await runClaudeAuthStatus();
+    let parsed: Record<string, unknown> | undefined;
+    try {
+      parsed = JSON.parse(raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1)) as Record<string, unknown>;
+    } catch {
+      parsed = undefined;
+    }
+    if (!parsed) {
+      return { loggedIn: false, lines: [raw.trim() || "Claude auth status returned no output."] };
+    }
+
+    const loggedIn = parsed.loggedIn === true;
+    const lines = [`Claude: ${loggedIn ? "authenticated" : "not authenticated"}`];
+    for (const [label, key] of [
+      ["Method", "authMethod"],
+      ["Account", "email"],
+      ["Plan", "subscriptionType"],
+    ] as const) {
+      const value = parsed[key];
+      if (typeof value === "string" && value.trim()) {
+        lines.push(`${label}: ${value.trim()}`);
+      }
+    }
+    if (!loggedIn) {
+      lines.push("Use /login to sign in again from here.");
+    }
+    return { loggedIn, lines };
   };
 
   const submitClaudeLoginCode = async (
@@ -679,6 +745,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     queuedClaudePrompts.removeContext(key);
     claudeIntakeLocks.delete(key);
     pendingIdleSteers.delete(key);
+    pendingQueuedPrompts.delete(key);
     activeProgressRefreshers.delete(key);
     cancelPendingClaudeLogin(key);
     void disposeClaudeDescriptor(claudeSessions.get(key)).catch((error) => {
@@ -1133,6 +1200,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     try {
       await session.pauseActiveGoal();
       queuedPrompts.delete(contextKey);
+      clearQueuedPromptAction(contextKey);
       activeProgressRefreshers.delete(contextKey);
       busyState.processing = false;
       return true;
@@ -1334,9 +1402,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   ): Promise<void> => {
     const replaced = queuedPrompts.has(contextKey);
     queuedPrompts.set(contextKey, { ctx, chatId, session, userInput });
-    const text = replaced
-      ? "Still working. I replaced the queued message with your latest one. Use /abort if the current task is stuck."
-      : "Still working. I queued this message and will run it next. Use /abort if the current task is stuck.";
+    pendingQueuedPrompts.set(contextKey, { provider: "codex", text: userInput });
+    const text = [
+      replaced
+        ? "Still working. I replaced the queued message with your latest one."
+        : "Still working. I queued this message and will run it next.",
+      QUEUED_PROMPT_ACTION_HINT,
+    ].join("\n");
     await safeReply(ctx, escapeHTML(text), { fallbackText: text });
   };
 
@@ -1345,7 +1417,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     contextKey: TelegramContextKey,
     text: string,
     options: { kind?: ClaudeQueuedPromptKind; front?: boolean; deliveryFailures?: number } = {},
-  ): number => {
+  ): { entry: ClaudePromptQueueEntry; depth: number } => {
     const queuedText = options.kind === "steer"
       ? `Additional instruction for the previous Claude task:\n\n${text}`
       : text;
@@ -1365,7 +1437,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (source.ctx) {
       liveQueuedClaudeContexts.set(entry.id, source.ctx);
     }
-    return depth;
+    return { entry, depth };
   };
 
   const queueClaudePromptReply = async (
@@ -1375,7 +1447,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     text: string,
     options: { kind?: ClaudeQueuedPromptKind; front?: boolean } = {},
   ): Promise<void> => {
-    const depth = enqueueClaudePromptFromSource({
+    const { entry, depth } = enqueueClaudePromptFromSource({
       ctx,
       chatId,
       messageThreadId: parseContextKey(contextKey).messageThreadId,
@@ -1385,9 +1457,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         ? `Claude is still working. I queued this /steer instruction as Claude follow-up #${depth}.`
         : "Claude is still working. I queued this /steer instruction as a Claude follow-up after the current turn finishes."
       : depth > 1
-        ? `Claude is still working. I queued this Claude message as item #${depth}. Use /stop if the current task is stuck.`
-        : "Claude is still working. I queued this Claude message and will run it next. Use /stop if the current task is stuck.";
-    await safeReply(ctx, escapeHTML(replyText), { fallbackText: replyText });
+        ? `Claude is still working. I queued this Claude message as item #${depth}.`
+        : "Claude is still working. I queued this Claude message and will run it next.";
+    pendingQueuedPrompts.set(contextKey, { provider: "claude", claudeEntryId: entry.id, text });
+    const fullText = `${replyText}\n${QUEUED_PROMPT_ACTION_HINT}`;
+    await safeReply(ctx, escapeHTML(fullText), { fallbackText: fullText });
   };
 
   const setReaction = async (ctx: Context, emoji: "👀" | "👍" | "❤" | "🔥" | "👏"): Promise<void> => {
@@ -2585,6 +2659,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         const queued = queuedPrompts.get(contextKey);
         if (queued) {
           queuedPrompts.delete(contextKey);
+          clearQueuedPromptAction(contextKey);
           await setReaction(queued.ctx, "👀");
           startUserPrompt(queued.ctx, contextKey, queued.chatId, queued.session, queued.userInput);
         }
@@ -3230,6 +3305,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (!queued) {
       return;
     }
+    clearQueuedPromptAction(contextKey, queued.id);
     lastPromptInput.set(contextKey, queued.text);
     const ctx = liveQueuedClaudeContexts.get(queued.id);
     if (ctx) {
@@ -3544,6 +3620,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   ): Promise<void> => {
     if (commandName === "stop" || commandName === "abort") {
       await abortClaudeSession(ctx, contextKey, messageThreadId);
+      return;
+    }
+
+    if (commandName === "login") {
+      // Same flow as /claude-login. Reachable under its natural name so a dead
+      // OAuth token can be repaired from Telegram without knowing the alias.
+      await startClaudeLoginFlow(ctx, contextKey, argument.trim() || undefined);
       return;
     }
 
@@ -4324,6 +4407,17 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
 
+    // In a Claude lane the Codex answer is useless: report the provider that is
+    // actually about to run, so a dead Claude token is visible before a turn fails.
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (config.enableClaudeProvider && rawContextKey && isClaudeActive(rawContextKey)) {
+      const claudeAuth = await readClaudeAuthSummary();
+      const icon = claudeAuth.loggedIn ? "✅" : "❌";
+      const plain = [`${icon} ${claudeAuth.lines[0]}`, ...claudeAuth.lines.slice(1)].join("\n");
+      await safeReply(ctx, escapeHTML(plain), { fallbackText: plain });
+      return;
+    }
+
     const authStatus = await checkAuthStatus(config.codexApiKey);
     const icon = authStatus.authenticated ? "✅" : "❌";
     const html = [
@@ -4717,6 +4811,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       });
     } finally {
       queuedPrompts.delete(contextKey);
+      clearQueuedPromptAction(contextKey);
       activeProgressRefreshers.delete(contextKey);
       getBusyState(contextKey).processing = false;
     }
@@ -4826,6 +4921,119 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     startUserPrompt(ctx, contextKey, chatId, contextSession.session, pending.text);
   });
 
+  /**
+   * s/d answers to the queued-prompt offer. Same pass-through contract as y/n: with
+   * nothing queued a literal "s" is an ordinary prompt, so this only ever fires on a
+   * message the user parked seconds earlier.
+   */
+  const handleQueuedPromptAction = async (
+    ctx: Context,
+    action: "steer" | "drop",
+    next: () => Promise<void>,
+  ): Promise<void> => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      await next();
+      return;
+    }
+    const pending = pendingQueuedPrompts.get(contextKey);
+    if (!pending) {
+      await next();
+      return;
+    }
+    pendingQueuedPrompts.delete(contextKey);
+
+    const reply = async (message: string): Promise<void> => {
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    };
+
+    if (pending.provider === "claude") {
+      const entryId = pending.claudeEntryId;
+      const entry = entryId ? queuedClaudePrompts.get(entryId) : undefined;
+      if (!entry) {
+        // Don't fall through: a literal "s" must not become a new prompt here.
+        await reply("That queued message already started running. Use /stop to abort the turn.");
+        return;
+      }
+      if (action === "drop") {
+        queuedClaudePrompts.remove(entry.id);
+        liveQueuedClaudeContexts.delete(entry.id);
+        await reply("Dropped the queued message. Nothing was sent to Claude.");
+        return;
+      }
+      if (!isProviderBusy(contextKey, "claude") && !getBusyState(contextKey).processing) {
+        await reply("The turn already finished, so your message is starting now as a normal prompt.");
+        return;
+      }
+      queuedClaudePrompts.remove(entry.id);
+      liveQueuedClaudeContexts.delete(entry.id);
+      const chatId = ctx.chat?.id;
+      if (chatId === undefined) {
+        return;
+      }
+      // routeClaudeSteer re-queues the text if the live steer cannot be delivered,
+      // so a failed injection never silently loses the message.
+      await routeClaudeSteer({
+        ctx,
+        chatId,
+        messageThreadId: parseContextKey(contextKey).messageThreadId,
+      }, contextKey, entry.text);
+      return;
+    }
+
+    const queued = queuedPrompts.get(contextKey);
+    if (!queued) {
+      await reply("That queued message already started running. Use /stop to abort the turn.");
+      return;
+    }
+    if (action === "drop") {
+      queuedPrompts.delete(contextKey);
+      await reply("Dropped the queued message. Nothing was sent to Codex.");
+      return;
+    }
+    if (!isBusy(contextKey)) {
+      await reply("The turn already finished, so your message is starting now as a normal prompt.");
+      return;
+    }
+    if (!queued.session.steer) {
+      pendingQueuedPrompts.set(contextKey, pending);
+      await reply(
+        "Native steering requires the app-server backend, so I left the message queued. Send d to drop it instead.",
+      );
+      return;
+    }
+    try {
+      await queued.session.steer(queued.userInput);
+      queuedPrompts.delete(contextKey);
+      await reply("Steer sent to the running Codex turn.");
+    } catch (error) {
+      pendingQueuedPrompts.set(contextKey, pending);
+      await reply(`Steer failed, so the message stays queued: ${friendlyErrorText(error)}`);
+    }
+  };
+
+  bot.hears(/^(s|steer)[.!]?$/i, async (ctx, next) => {
+    await handleQueuedPromptAction(ctx, "steer", next);
+  });
+
+  bot.hears(/^(d|drop)[.!]?$/i, async (ctx, next) => {
+    await handleQueuedPromptAction(ctx, "drop", next);
+  });
+
+  bot.command(["qsteer", "qs"], async (ctx) => {
+    await handleQueuedPromptAction(ctx, "steer", async () => {
+      const message = "No queued message to steer. Use /steer <text> to steer the running turn directly.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    });
+  });
+
+  bot.command(["qdrop", "qd"], async (ctx) => {
+    await handleQueuedPromptAction(ctx, "drop", async () => {
+      const message = "No queued message to drop.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    });
+  });
+
   bot.command("goal", async (ctx) => {
     const parsedGoal = parseGoalModeArgument(getCommandArgument(ctx));
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
@@ -4889,6 +5097,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             await session.abort();
           }
           queuedPrompts.delete(contextKey);
+          clearQueuedPromptAction(contextKey);
           activeProgressRefreshers.delete(contextKey);
           getBusyState(contextKey).processing = false;
         }
@@ -5566,6 +5775,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
     registry.setBackend(contextKey, requestedBackend);
     queuedPrompts.delete(contextKey);
+    clearQueuedPromptAction(contextKey);
     const busyState = getBusyState(contextKey);
     busyState.processing = false;
     busyState.switching = false;
@@ -7176,6 +7386,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       console.warn("Abort callback failed", error);
     } finally {
       queuedPrompts.delete(contextKey as TelegramContextKey);
+      clearQueuedPromptAction(contextKey as TelegramContextKey);
       activeProgressRefreshers.delete(contextKey as TelegramContextKey);
       getBusyState(contextKey as TelegramContextKey).processing = false;
     }
@@ -7989,11 +8200,13 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "abort", description: "Cancel current operation" },
     { command: "stop", description: "Cancel current operation" },
     { command: "steer", description: "Steer active Codex app-server or Claude turn" },
+    { command: "qsteer", description: "Steer the queued message into the running turn" },
+    { command: "qdrop", description: "Drop the queued message" },
     { command: "launch_profiles", description: "Select launch profile" },
     { command: "model", description: "View & change model" },
     { command: "effort", description: "Set reasoning effort" },
     { command: "auth", description: "Check auth status" },
-    { command: "login", description: "Start authentication" },
+    { command: "login", description: "Start authentication (Claude login in a Claude lane)" },
     { command: "claude_login", description: "Start Claude Code login" },
     { command: "logout", description: "Sign out" },
     { command: "voice", description: "Voice transcription status" },

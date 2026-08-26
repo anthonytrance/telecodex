@@ -167,6 +167,39 @@ describe("CodexAppServerClient", () => {
     );
     expect(requests.some((request) => request.method === "initialized")).toBe(true);
   });
+
+  it("passes config overrides as TOML-encoded -c args before the subcommand", async () => {
+    let spawnArgs: string[] = [];
+    const spawnProcess: SpawnAppServerProcess = (_command, args) => {
+      spawnArgs = args;
+      return new FakeAppServerProcess(() => undefined);
+    };
+
+    const client = new CodexAppServerClient({
+      codexPath: "fake-codex",
+      spawnProcess,
+      requestTimeoutMs: 1000,
+      configOverrides: {
+        model_provider: "modelstudio",
+        // Bare backslashes here make Codex fail config loading outright, so the
+        // path has to arrive quoted and escaped.
+        model_catalog_json: "C:\\Users\\test\\.codex\\model-catalog.qwen.json",
+      },
+    });
+
+    await client.start();
+    await client.close();
+
+    expect(spawnArgs).toEqual([
+      "-c",
+      'model_provider="modelstudio"',
+      "-c",
+      'model_catalog_json="C:\\\\Users\\\\test\\\\.codex\\\\model-catalog.qwen.json"',
+      "app-server",
+      "--listen",
+      "stdio://",
+    ]);
+  });
 });
 
 describe("probeCodexAppServer", () => {

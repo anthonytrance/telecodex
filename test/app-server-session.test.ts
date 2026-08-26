@@ -5,7 +5,12 @@ import {
   type AppServerClientLike,
   type AppServerNotification,
 } from "../src/app-server-session.js";
-import { DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS, type AppServerServerRequest, type JsonValue } from "../src/app-server.js";
+import {
+  DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS,
+  type AppServerClientOptions,
+  type AppServerServerRequest,
+  type JsonValue,
+} from "../src/app-server.js";
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { TeleCodeConfig } from "../src/config.js";
 
@@ -860,6 +865,42 @@ describe("AppServerSessionService", () => {
       expect(service.isProcessing()).toBe(false);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("spawns the app-server against the vendor endpoint when a vendor model is selected", async () => {
+    vi.stubEnv("DASHSCOPE_API_KEY", "sk-sp-test");
+    try {
+      const spawns: AppServerClientOptions[] = [];
+      const factory = (options: AppServerClientOptions) => {
+        spawns.push(options);
+        return new FakeAppServerClient((method) => {
+          if (method === "thread/start") {
+            return { thread: { id: "thread-1", cwd: "/workspace/project" } };
+          }
+          throw new Error(`unexpected request ${method}`);
+        });
+      };
+
+      const service = await AppServerSessionService.create(createConfig(), {
+        appServerClientFactory: factory,
+        model: "qwen3.8-max",
+      });
+
+      expect(spawns).toHaveLength(1);
+      expect(spawns[0]?.configOverrides?.model_provider).toBe("modelstudio");
+      expect(spawns[0]?.env?.DASHSCOPE_API_KEY).toBe("sk-sp-test");
+      expect(service.getInfo().model).toBe("qwen3.8-max");
+
+      // Back to a native model: the child has to be replaced, because its provider
+      // and API key were fixed when it was spawned.
+      service.setModel("gpt-5.5");
+      await service.newThread();
+
+      expect(spawns).toHaveLength(2);
+      expect(spawns[1]?.configOverrides).toEqual({});
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 });

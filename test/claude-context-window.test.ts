@@ -14,6 +14,11 @@ describe("claude context window per model", () => {
     expect(contextWindowForModel("claude-haiku-4-5-20251001")).toBe(200_000);
   });
 
+  it("uses the registered vendor model window", () => {
+    expect(contextWindowForModel("qwen3.8-max")).toBe(1_000_000);
+    expect(contextWindowForModel("qwen")).toBe(1_000_000);
+  });
+
   it("defers to the configured default for anything it does not recognise", () => {
     expect(contextWindowForModel("some-future-model")).toBeUndefined();
     expect(contextWindowForModel(undefined)).toBeUndefined();

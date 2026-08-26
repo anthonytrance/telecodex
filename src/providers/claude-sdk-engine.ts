@@ -1,5 +1,10 @@
 import { bridgeLog } from "../bridge-log.js";
 import type { ClaudePermissionMode } from "../config.js";
+import {
+  buildVendorClaudeEnv,
+  buildVendorClaudeSettingsEnv,
+  resolveVendorModel,
+} from "../model-vendors.js";
 import type { AgentProviderEvent } from "./types.js";
 
 /**
@@ -609,7 +614,7 @@ function buildSdkQueryOptions(options: {
     // The child must never start the user-scoped Telegram plugin's poller. It
     // would compete with this bridge for the same bot token.
     strictMcpConfig: true,
-    env: scrubbedEnv(options.autoCompactWindow),
+    env: scrubbedEnv(options.autoCompactWindow, options.model, options.cwd),
     ...(options.resume ? { resume: options.resume } : {}),
     ...(options.forkSession ? { forkSession: true } : {}),
     ...(options.abortController ? { abortController: options.abortController } : {}),
@@ -630,7 +635,11 @@ function sdkUserMessage(text: string, priority?: SdkUserMessageLike["priority"])
   };
 }
 
-function scrubbedEnv(autoCompactWindow?: number): Record<string, string | undefined> {
+function scrubbedEnv(
+  autoCompactWindow?: number,
+  model?: string,
+  workspace?: string,
+): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env };
   delete env.TELEGRAM_BOT_TOKEN;
   for (const key of Object.keys(env)) {
@@ -645,6 +654,17 @@ function scrubbedEnv(autoCompactWindow?: number): Record<string, string | undefi
   }
   if (autoCompactWindow !== undefined && Number.isSafeInteger(autoCompactWindow) && autoCompactWindow > 0) {
     env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(autoCompactWindow);
+  }
+  // The SDK backend takes no --settings file, so a vendor's endpoint, model pins and
+  // auth all go into the child environment. Applied after the scrub above, otherwise
+  // the CLAUDE_CODE_* pins would be deleted again.
+  const vendorHit = model ? resolveVendorModel(model) : null;
+  if (vendorHit) {
+    Object.assign(
+      env,
+      buildVendorClaudeSettingsEnv(vendorHit),
+      buildVendorClaudeEnv(vendorHit, { workspace }),
+    );
   }
   return env;
 }

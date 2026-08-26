@@ -50,6 +50,12 @@ export interface AppServerClientOptions {
   env?: NodeJS.ProcessEnv;
   requestTimeoutMs?: number;
   spawnProcess?: SpawnAppServerProcess;
+  /**
+   * Extra dotted config keys passed as `-c key=value`, e.g. the vendor's
+   * `model_provider`. The app-server reads them once at spawn, so changing them
+   * means respawning the child.
+   */
+  configOverrides?: Record<string, string | number | boolean>;
 }
 
 export type AppServerServerRequest = {
@@ -214,7 +220,11 @@ export class CodexAppServerClient {
     const spawnProcess = this.options.spawnProcess ?? defaultSpawnAppServerProcess;
     // MCP override args go before the subcommand; /mcp off keeps configured MCP
     // servers (Hermes, cua-driver) from cold-starting on every thread lifecycle.
-    const child = spawnProcess(codexPath, [...buildCodexMcpOverrideArgs(), "app-server", "--listen", "stdio://"], {
+    const overrideArgs = [
+      ...buildCodexMcpOverrideArgs(),
+      ...buildConfigOverrideArgs(this.options.configOverrides),
+    ];
+    const child = spawnProcess(codexPath, [...overrideArgs, "app-server", "--listen", "stdio://"], {
       cwd: this.options.cwd,
       env,
     });
@@ -832,7 +842,32 @@ function defaultSpawnAppServerProcess(
     cwd: options.cwd,
     env: options.env,
     stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
   });
+}
+
+/**
+ * Dotted config keys rendered as `-c key=value` CLI args.
+ *
+ * Values are TOML-encoded, not pasted raw: a Windows path handed over as a bare
+ * string makes Codex 0.147 fail config loading outright ("AbsolutePathBuf
+ * deserialized without a base path"), because the backslashes are read as TOML
+ * escapes. JSON.stringify produces the quoted-and-escaped form Codex accepts,
+ * which is also what the Codex SDK emits for its own `--config` flags.
+ */
+export function buildConfigOverrideArgs(
+  overrides: Record<string, string | number | boolean> | undefined,
+): string[] {
+  if (!overrides) {
+    return [];
+  }
+
+  const args: string[] = [];
+  for (const [key, value] of Object.entries(overrides)) {
+    const encoded = typeof value === "string" ? JSON.stringify(value) : String(value);
+    args.push("-c", `${key}=${encoded}`);
+  }
+  return args;
 }
 
 export function buildAppServerEnv(apiKey?: string): NodeJS.ProcessEnv {

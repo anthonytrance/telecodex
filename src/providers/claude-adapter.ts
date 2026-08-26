@@ -6,6 +6,12 @@ import { randomUUID } from "node:crypto";
 import { bridgeLog } from "../bridge-log.js";
 import type { ClaudePermissionMode, TeleCodeConfig } from "../config.js";
 import {
+  buildVendorClaudeEnv,
+  buildVendorClaudeSettingsEnv,
+  canonicalizeVendorModel,
+  resolveVendorModel,
+} from "../model-vendors.js";
+import {
   ClaudeSdkInputController,
   runClaudeSdkCompact,
   runClaudeSdkTurn,
@@ -458,10 +464,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     const modelCommand = parseClaudeModelCommand(promptText);
     if (modelCommand) {
-      runtime.model = modelCommand;
-      runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model: modelCommand };
+      const model = canonicalizeVendorModel(modelCommand);
+      runtime.model = model;
+      runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model };
       runtime.descriptor.updatedAt = Date.now();
-      const text = `Claude model set to ${modelCommand} for the next turn (sdk backend).`;
+      const text = `Claude model set to ${model} for the next turn (sdk backend).`;
       yield { type: "assistant_text_delta", sessionId: runtime.descriptor.id, jobId, text };
       yield { type: "assistant_message_complete", sessionId: runtime.descriptor.id, jobId, text };
       return;
@@ -733,7 +740,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       args.unshift("--dangerously-skip-permissions");
     }
 
-    args.push("--settings", JSON.stringify(TELECODE_CLAUDE_SETTINGS));
+    // One --settings flag only: a vendor overlay is merged into TeleCode's own
+    // settings rather than passed separately, because a second flag would replace
+    // the first instead of adding to it.
+    const vendorHit = resolveVendorModel(runtime.model);
+    args.push("--settings", JSON.stringify(buildClaudeSettings(vendorHit)));
     args.push("--append-system-prompt", TELECODE_CLAUDE_SYSTEM_PROMPT);
 
     const strictMcp = this.config.claudeStrictMcpConfig;
@@ -752,6 +763,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       cwd: runtime.workspace,
       configDir: strictMcp ? undefined : this.config.claudeConfigDir,
       autoCompactWindow: this.config.claudeAutoCompactWindow,
+      // Only the token travels by env; every CLAUDE_CODE_* variable is stripped from
+      // the inherited environment, so the rest rides in the settings overlay above.
+      extraEnv: vendorHit
+        ? buildVendorClaudeEnv(vendorHit, { workspace: runtime.workspace })
+        : undefined,
     });
     runtime.ptyPid = ptySession.pid;
     if (runtime.forkSourceSessionId) {
@@ -1172,11 +1188,17 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     if (!providerSessionId) {
       throw new Error("Claude descriptor is missing providerSessionId");
     }
+    const persistedModel = asString(descriptor.metadata?.model) || this.config.claudeDefaultModel;
+    const model = canonicalizeVendorModel(persistedModel);
     return {
-      descriptor: { ...descriptor, capabilities: CLAUDE_CAPABILITIES },
+      descriptor: {
+        ...descriptor,
+        capabilities: CLAUDE_CAPABILITIES,
+        metadata: { ...descriptor.metadata, model },
+      },
       providerSessionId,
       workspace: descriptor.workspace || this.config.claudeWorkspace,
-      model: asString(descriptor.metadata?.model) || this.config.claudeDefaultModel,
+      model,
       permissionMode: asPermissionMode(descriptor.metadata?.permissionMode) || this.config.claudePermissionMode,
       backend: asClaudeBackend(descriptor.metadata?.backend) || this.config.claudeBackend,
       busy: false,
@@ -1212,6 +1234,10 @@ const CLAUDE_CONTEXT_WINDOWS: ReadonlyArray<readonly [RegExp, number]> = [
 export function contextWindowForModel(model: string | undefined): number | undefined {
   if (!model) {
     return undefined;
+  }
+  const vendorWindow = resolveVendorModel(model)?.model.contextWindow;
+  if (vendorWindow) {
+    return vendorWindow;
   }
   for (const [pattern, window] of CLAUDE_CONTEXT_WINDOWS) {
     if (pattern.test(model)) {
@@ -1302,6 +1328,20 @@ const TELECODE_CLAUDE_SETTINGS = {
     "telegram@claude-plugins-official": false,
   },
 };
+
+/** TeleCode's own settings, plus the endpoint and model pins when a vendor is active. */
+export function buildClaudeSettings(
+  vendorHit: ReturnType<typeof resolveVendorModel>,
+): Record<string, unknown> {
+  if (!vendorHit) {
+    return { ...TELECODE_CLAUDE_SETTINGS };
+  }
+  const env = buildVendorClaudeSettingsEnv(vendorHit);
+  if (Object.keys(env).length === 0) {
+    return { ...TELECODE_CLAUDE_SETTINGS };
+  }
+  return { ...TELECODE_CLAUDE_SETTINGS, env };
+}
 
 const TELECODE_CLAUDE_SYSTEM_PROMPT = [
   "You are running inside TeleCode, which relays this Claude Code session to the user through its own Telegram bot.",

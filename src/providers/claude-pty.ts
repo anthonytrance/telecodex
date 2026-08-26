@@ -21,6 +21,8 @@ export interface ClaudePtySpawnOptions {
   configDir?: string;
   /** Effective window Claude Code uses when deciding when to auto-compact. */
   autoCompactWindow?: number;
+  /** Applied after the CLAUDE_CODE_* scrub, so vendor auth survives it. */
+  extraEnv?: Record<string, string>;
   cols?: number;
   rows?: number;
 }
@@ -333,6 +335,9 @@ export function buildClaudePtyEnv(
     env.CLAUDE_CONFIG_DIR = options.configDir;
   } else {
     delete env.CLAUDE_CONFIG_DIR;
+  }
+  for (const [key, value] of Object.entries(options.extraEnv ?? {})) {
+    env[key] = value;
   }
   return env;
 }

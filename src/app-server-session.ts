@@ -31,6 +31,12 @@ import {
   type CodexThreadRecord,
 } from "./codex-state.js";
 import type { TeleCodeConfig } from "./config.js";
+import {
+  buildVendorCodexConfig,
+  buildVendorCodexEnv,
+  resolveVendorModel,
+  type ResolvedVendorModel,
+} from "./model-vendors.js";
 import type { CodexReasoningEffort } from "./reasoning-effort.js";
 
 type AppServerThread = {
@@ -103,6 +109,7 @@ export class AppServerSessionService {
   private currentWorkspace: string;
   private currentThreadId: string | null = null;
   private currentModel: string | undefined;
+  private currentVendor: ResolvedVendorModel | null = null;
   private currentReasoningEffort: CodexReasoningEffort | undefined;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
@@ -123,14 +130,14 @@ export class AppServerSessionService {
     private readonly createClient: AppServerClientFactory = (options) => new CodexAppServerClient(options),
   ) {
     this.currentWorkspace = config.workspace;
-    this.currentModel = config.codexModel;
+    this.applyModel(config.codexModel);
     this.currentLaunchProfile = getLaunchProfile(config, config.defaultLaunchProfileId);
   }
 
   static async create(config: TeleCodeConfig, options?: AppServerCreateOptions): Promise<AppServerSessionService> {
     const service = new AppServerSessionService(config, options?.appServerClientFactory);
     service.currentWorkspace = options?.workspace ?? config.workspace;
-    service.currentModel = options?.model ?? config.codexModel;
+    service.applyModel(options?.model ?? config.codexModel);
     service.currentReasoningEffort = options?.reasoningEffort as CodexReasoningEffort | undefined;
     service.currentLaunchProfile = getLaunchProfile(
       config,
@@ -485,7 +492,7 @@ export class AppServerSessionService {
     this.appServerAttachedThreadId = response.thread.id;
     this.currentWorkspace = response.cwd ?? response.thread.cwd ?? this.currentWorkspace;
     if (response.model) {
-      this.currentModel = response.model;
+      this.applyModel(response.model);
     }
     return this.getInfo();
   }
@@ -555,7 +562,7 @@ export class AppServerSessionService {
     this.activeThreadLaunchProfile = null;
     this.currentWorkspace = workspace ?? this.currentWorkspace;
     if (model) {
-      this.currentModel = model;
+      this.applyModel(model);
     }
     this.resetSessionTokens();
     return this.getInfo();
@@ -566,6 +573,9 @@ export class AppServerSessionService {
 
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
+    // Settle the vendor before the client is spawned: the app-server child reads
+    // its provider config and API key once, at startup.
+    this.applyModel(effectiveModel);
     const client = await this.getClient();
     const response = await client.request<{ thread: AppServerThread; model?: string; cwd?: string }>(
       "thread/start",
@@ -584,7 +594,7 @@ export class AppServerSessionService {
     this.currentThreadId = response.thread.id;
     this.appServerAttachedThreadId = response.thread.id;
     if (model || response.model) {
-      this.currentModel = response.model ?? model;
+      this.applyModel(response.model ?? model);
     }
     return this.getInfo();
   }
@@ -605,7 +615,7 @@ export class AppServerSessionService {
     this.appServerAttachedThreadId = response.thread.id;
     this.currentWorkspace = response.cwd ?? response.thread.cwd ?? this.currentWorkspace;
     if (response.model) {
-      this.currentModel = response.model;
+      this.applyModel(response.model);
     }
     return this.getInfo();
   }
@@ -619,7 +629,8 @@ export class AppServerSessionService {
       this.currentWorkspace = record.cwd;
     }
     if (record?.model) {
-      this.currentModel = record.model;
+      // Before the resume, so the client spawns against the thread's own vendor.
+      this.applyModel(record.model);
     }
     return await this.resumeThread(resolvedThreadId);
   }
@@ -638,8 +649,29 @@ export class AppServerSessionService {
 
   setModel(slug: string): string {
     this.ensureIdle("change model");
-    this.currentModel = slug;
+    this.applyModel(slug);
     return slug;
+  }
+
+  /**
+   * Point the session at a model, and at the vendor endpoint that serves it.
+   * Dropping the client is what actually moves the endpoint: the app-server child
+   * reads its provider config and env once, when it is spawned. The thread id
+   * survives, so the next request respawns and re-attaches via thread/resume.
+   */
+  private applyModel(slug: string | undefined): void {
+    const previousVendorId = this.currentVendor?.vendor.id ?? null;
+    this.currentModel = slug;
+    this.currentVendor = slug ? resolveVendorModel(slug) : null;
+    if ((this.currentVendor?.vendor.id ?? null) !== previousVendorId) {
+      this.closeClient();
+    }
+  }
+
+  private closeClient(): void {
+    void this.client?.close();
+    this.client = null;
+    this.appServerAttachedThreadId = null;
   }
 
   async runText(input: CodexPromptInput): Promise<string> {
@@ -674,9 +706,7 @@ export class AppServerSessionService {
    */
   resetBackendClient(): void {
     this.ensureIdle("apply the MCP toggle");
-    void this.client?.close();
-    this.client = null;
-    this.appServerAttachedThreadId = null;
+    this.closeClient();
   }
 
   getSelectedLaunchProfile(): CodexLaunchProfile {
@@ -709,10 +739,15 @@ export class AppServerSessionService {
     }
 
     this.appServerAttachedThreadId = null;
+    const vendor = this.currentVendor;
     const client = this.createClient({
       codexPath: this.config.codexAppServerPath,
       cwd: this.config.workspace,
-      env: buildAppServerEnv(this.config.codexApiKey),
+      env: {
+        ...buildAppServerEnv(this.config.codexApiKey),
+        ...(vendor ? buildVendorCodexEnv(vendor, { workspace: this.config.workspace }) : {}),
+      },
+      configOverrides: vendor ? buildVendorCodexConfig(vendor) : {},
     });
     client.onNotification((notification) => this.handleNotification(notification));
     client.onRequest((request) => this.handleServerRequest(request));

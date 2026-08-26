@@ -12,6 +12,12 @@ import {
 import { buildCodexMcpOverrideConfig } from "./codex-mcp-toggle.js";
 import type { TeleCodeConfig } from "./config.js";
 import {
+  buildVendorCodexConfig,
+  buildVendorCodexEnv,
+  resolveVendorModel,
+  type ResolvedVendorModel,
+} from "./model-vendors.js";
+import {
   getThread,
   getThreadByPrefix,
   listModels,
@@ -121,6 +127,8 @@ export class CodexSessionService {
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
   private sessionTokens = { input: 0, cached: 0, output: 0 };
+  /** Non-null when the active model is served by an alternative vendor endpoint. */
+  private currentVendor: ResolvedVendorModel | null = null;
 
   private constructor(private readonly config: TeleCodeConfig) {
     this.currentWorkspace = config.workspace;
@@ -131,6 +139,7 @@ export class CodexSessionService {
     const service = new CodexSessionService(config);
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
+    service.currentVendor = service.currentModel ? resolveVendorModel(service.currentModel) : null;
     service.currentReasoningEffort = options?.reasoningEffort as CodexReasoningEffort | undefined;
     service.currentLaunchProfile = getLaunchProfile(
       config,
@@ -339,7 +348,7 @@ export class CodexSessionService {
     this.activeThreadLaunchProfile = null;
     this.currentWorkspace = workspace ?? this.currentWorkspace;
     if (model) {
-      this.currentModel = model;
+      this.applyModel(model);
     }
     this.resetSessionTokens();
     return this.getInfo();
@@ -350,14 +359,14 @@ export class CodexSessionService {
 
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
+    // Applied before the client is used, so a vendor model starts its thread on the
+    // vendor endpoint rather than on the previous one.
+    this.applyModel(effectiveModel);
     this.thread = this.getCodex().startThread(this.buildThreadOptions(effectiveWorkspace, effectiveModel));
     this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = effectiveWorkspace;
     this.currentThreadId = this.thread.id ?? null;
-    if (model) {
-      this.currentModel = model;
-    }
     return this.getInfo();
   }
 
@@ -382,14 +391,16 @@ export class CodexSessionService {
     const workspace = record?.cwd ?? this.currentWorkspace;
     const model = record?.model || undefined;
 
+    // A stored thread can carry a vendor model, so the endpoint has to follow the
+    // thread rather than stay on whatever the session was last using.
+    if (model) {
+      this.applyModel(model);
+    }
     this.thread = this.getCodex().resumeThread(resolvedThreadId, this.buildThreadOptions(workspace, model));
     this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = workspace;
     this.currentThreadId = resolvedThreadId;
-    if (model) {
-      this.currentModel = model;
-    }
     return this.getInfo();
   }
 
@@ -407,7 +418,7 @@ export class CodexSessionService {
 
   setModel(slug: string): string {
     this.ensureIdle("change model");
-    this.currentModel = slug;
+    this.applyModel(slug);
     if (this.currentThreadId) {
       this.thread = this.getCodex().resumeThread(
         this.currentThreadId,
@@ -592,14 +603,33 @@ export class CodexSessionService {
     return this.codex!;
   }
 
+  /**
+   * Point the session at a model, and at the vendor endpoint that serves it.
+   * Rebuilding the client is what actually moves the endpoint: the Codex SDK reads
+   * its config and env once, when the client is constructed.
+   */
+  private applyModel(slug: string | undefined): void {
+    const previousVendorId = this.currentVendor?.vendor.id ?? null;
+    this.currentModel = slug;
+    this.currentVendor = slug ? resolveVendorModel(slug) : null;
+    if ((this.currentVendor?.vendor.id ?? null) !== previousVendorId) {
+      this.resetCodexClient();
+    }
+  }
+
   private resetCodexClient(): void {
+    const vendor = this.currentVendor;
     this.codex = new Codex({
       apiKey: this.config.codexApiKey,
       config: {
         approval_policy: this.currentLaunchProfile.approvalPolicy,
         ...buildCodexMcpOverrideConfig(),
+        ...(vendor ? buildVendorCodexConfig(vendor) : {}),
       },
-      env: buildCodexEnv(this.config.codexApiKey),
+      env: {
+        ...buildCodexEnv(this.config.codexApiKey),
+        ...(vendor ? buildVendorCodexEnv(vendor, { workspace: this.config.workspace }) : {}),
+      },
     });
   }
 }

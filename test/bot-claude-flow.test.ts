@@ -6,7 +6,24 @@ import { vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { TeleCodeConfig } from "../src/config.js";
+import { VENDOR_CREDENTIALS_FILENAME } from "../src/model-vendors.js";
 import { SessionRegistry } from "../src/session-registry.js";
+
+const mockVendorUsage = vi.hoisted(() => ({
+  read: vi.fn(async () => "Mock Qwen plan usage"),
+}));
+
+vi.mock("../src/usage-vendors.js", () => ({
+  USAGE_READERS: {
+    modelstudio: {
+      label: "QwenCloud Token Plan",
+      cmd: ["python", "qwen_usage.py"],
+      timeout: 60,
+    },
+  },
+  hasUsageReader: (vendorId: string) => vendorId === "modelstudio",
+  readVendorUsage: mockVendorUsage.read,
+}));
 
 const mockClaude = vi.hoisted(() => {
   const prompts: string[] = [];
@@ -325,7 +342,11 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
     }
 
     async getContext() {
-      return { usedTokens: 3, contextWindow: 200000, autoCompactWindow: 200000 };
+      return {
+        usedTokens: 3,
+        contextWindow: mockClaude.getActiveModel() === "qwen3.8-max" ? 1_000_000 : 200_000,
+        autoCompactWindow: 200_000,
+      };
     }
 
     async dispose(sessionId?: string) {
@@ -396,6 +417,7 @@ describe("Claude bot flow", () => {
     tempDir = mkdtempSync(path.join(tmpdir(), "telecode-bot-claude-"));
     mockClaude.reset();
     mockPty.reset();
+    mockVendorUsage.read.mockClear();
   });
 
   afterEach(() => {
@@ -492,6 +514,66 @@ describe("Claude bot flow", () => {
     expect(mockClaude.createSession).toHaveBeenCalledTimes(1);
     expect(mockClaude.prompts).toEqual(["say CANARY_OK only"]);
     expect(sent.map((entry) => entry.text)).toContain("mock reply to say CANARY_OK only");
+  });
+
+  it("routes an inline Claude vendor-model command through the fresh-session switch", async () => {
+    writeFileSync(
+      path.join(tempDir, VENDOR_CREDENTIALS_FILENAME),
+      JSON.stringify({ modelstudio: "sk-test" }),
+      "utf8",
+    );
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude original session"));
+    await waitFor(() => mockClaude.prompts.includes("original session"));
+    await waitForAgentSessionsIdle(tempDir);
+    await bot.handleUpdate(textUpdate(2, "/claude /model qwen"));
+
+    expect(mockClaude.createSession).toHaveBeenCalledTimes(2);
+    expect(mockClaude.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ model: "qwen3.8-max" }),
+    }));
+    expect(mockClaude.dispose).toHaveBeenCalledWith("claude-provider-1");
+    expect(mockClaude.prompts).toEqual(["original session"]);
+    expect(sent.map((entry) => entry.text)).toContain(
+      "New Claude session on qwen3.8-max (QwenCloud Token Plan). The next normal message will use it.",
+    );
+  });
+
+  it("reports Qwen usage with Claude session context instead of the Claude panel", async () => {
+    writeFileSync(
+      path.join(tempDir, VENDOR_CREDENTIALS_FILENAME),
+      JSON.stringify({ modelstudio: "sk-test" }),
+      "utf8",
+    );
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude /model qwen"));
+    await bot.handleUpdate(textUpdate(2, "/usage"));
+
+    const report = sent.map((entry) => entry.text ?? "").find((text) =>
+      text.includes("Mock Qwen plan usage"),
+    );
+    expect(mockVendorUsage.read).toHaveBeenCalledWith("modelstudio");
+    expect(report).toContain("Mock Qwen plan usage");
+    expect(report).toContain("Session context: 3 of 1000000 tokens (0%).");
+    expect(report).not.toContain("Mock Claude usage panel");
+  });
+
+  it("routes inline /claude /usage through the same Qwen-aware usage handler", async () => {
+    writeFileSync(
+      path.join(tempDir, VENDOR_CREDENTIALS_FILENAME),
+      JSON.stringify({ modelstudio: "sk-test" }),
+      "utf8",
+    );
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude /model qwen"));
+    await bot.handleUpdate(textUpdate(2, "/claude /usage"));
+
+    expect(mockVendorUsage.read).toHaveBeenCalledWith("modelstudio");
+    expect(mockClaude.prompts).toEqual([]);
+    expect(sent.map((entry) => entry.text ?? "").join("\n")).toContain("Mock Qwen plan usage");
   });
 
   it("honors a persisted SDK backend when creating the Claude runtime", async () => {

@@ -11,6 +11,13 @@ import * as pty from "node-pty";
 
 import { bridgeLog, initBridgeLog } from "./bridge-log.js";
 import { listConfiguredCodexMcpServers } from "./codex-mcp-toggle.js";
+import {
+  describeVendorModel,
+  isVendorAvailable,
+  listVendorModels,
+  resolveVendorModel,
+  VENDOR_CREDENTIALS_FILENAME,
+} from "./model-vendors.js";
 import { ClaudeBackendPrefs, claudeBackendPrefsPath, type ClaudeBackendChoice } from "./claude-backend-prefs.js";
 import {
   probeCodexAppServer,
@@ -98,6 +105,7 @@ import { createSessionSearchIndex, type SessionSearchHit } from "./session-searc
 import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
 import { mergeLiveAppServerRateLimits, readLatestCodexUsage, renderUsagePlain } from "./usage.js";
+import { hasUsageReader, readVendorUsage, USAGE_READERS } from "./usage-vendors.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 import { normalizePersistedWorkspace } from "./workspace-normalization.js";
 
@@ -490,6 +498,56 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       child.on("close", () => {
         resolve(output.trim() || "Claude auth status returned no output.");
       });
+    });
+  };
+
+  const runSaxoApproval = async (request: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const python = process.env.SAXO_APPROVAL_PYTHON
+      ?? path.join(config.workspace, "venv", "Scripts", "python.exe");
+    const repo = process.env.SAXO_APPROVAL_REPO
+      ?? path.join(config.workspace, "saxo-access");
+    if (!existsSync(python) || !existsSync(repo)) {
+      throw new Error("Saxo approval runtime is not installed.");
+    }
+    return await new Promise((resolve, reject) => {
+      const child = spawnProcess(python, ["-m", "saxo_access.native_approval"], {
+        cwd: repo,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        callback();
+      };
+      const timeout = setTimeout(() => {
+        child.kill();
+        finish(() => reject(new Error("Saxo SIM submission timed out. Its status is uncertain, so it was not retried.")));
+      }, 45_000);
+      child.stdout.on("data", (data: Buffer) => {
+        if (stdout.length < 64_000) stdout += data.toString("utf8");
+      });
+      child.stderr.on("data", (data: Buffer) => {
+        if (stderr.length < 8_000) stderr += data.toString("utf8");
+      });
+      child.on("error", (error) => finish(() => reject(error)));
+      child.on("close", (code) => finish(() => {
+        try {
+          const parsed = JSON.parse(stdout.trim()) as Record<string, unknown>;
+          if (code !== 0 || parsed.status !== "submitted") {
+            reject(new Error(String(parsed.reason ?? "Saxo SIM submission failed.")));
+            return;
+          }
+          resolve(parsed);
+        } catch (error) {
+          reject(new Error(stderr.trim() || `Saxo approval returned invalid output: ${friendlyErrorText(error)}`));
+        }
+      }));
+      child.stdin.end(JSON.stringify(request));
     });
   };
 
@@ -1086,6 +1144,42 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       metadata: descriptor.metadata,
     });
     return descriptor;
+  };
+
+  /**
+   * A vendor model cannot be swapped into a live Claude session: the endpoint and
+   * auth are fixed when the CLI starts. So this always creates a fresh session, the
+   * same way /model does for a normal model change. Session history is untouched,
+   * older sessions stay resumable from either endpoint.
+   */
+  const handleVendorModelForClaude = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    vendorHit: NonNullable<ReturnType<typeof resolveVendorModel>>,
+  ): Promise<void> => {
+    if (!vendorHit.model.claude) {
+      const text = `${vendorHit.model.slug} is not available for Claude sessions.`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+    if (!isVendorAvailable(vendorHit.vendor, { workspace: config.workspace })) {
+      const text = vendorUnavailableText(vendorHit);
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+    if (isProviderBusy(contextKey, "claude")) {
+      const text = "Cannot change Claude model while a Claude prompt is running. Use /stop first.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+    try {
+      await createFreshClaudeSession(contextKey, { model: vendorHit.model.slug });
+      const text = `New Claude session on ${describeVendorModel(vendorHit)}. The next normal message will use it.`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    } catch (error) {
+      const text = `Claude model change failed: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    }
   };
 
   const forkClaudeConversation = async (
@@ -3810,14 +3904,24 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
 
-    await safeReply(ctx, escapeHTML("Reading Claude usage limits..."), {
-      fallbackText: "Reading Claude usage limits...",
-      messageThreadId,
-    });
-
     try {
       const descriptor = await ensureClaudeSession(contextKey);
-      const report = await claudeAdapter.getUsageReport(descriptor.id);
+      const activeModel = String(descriptor.metadata?.model ?? config.claudeDefaultModel);
+      const activeVendor = resolveVendorModel(activeModel);
+      const vendorReader = activeVendor && hasUsageReader(activeVendor.vendor.id)
+        ? USAGE_READERS[activeVendor.vendor.id]
+        : undefined;
+      const readingMessage = vendorReader
+        ? `Reading ${vendorReader.label} usage...`
+        : "Reading Claude usage limits...";
+      await safeReply(ctx, escapeHTML(readingMessage), {
+        fallbackText: readingMessage,
+        messageThreadId,
+      });
+
+      const report = vendorReader && activeVendor
+        ? `**${vendorReader.label} usage**\n\n${await readVendorUsage(activeVendor.vendor.id)}`
+        : await claudeAdapter.getUsageReport(descriptor.id);
       const context = await claudeAdapter.getContext(descriptor.id);
       const used = Number(context.usedTokens ?? 0);
       const window = Number(context.contextWindow ?? config.claudeContextWindow);
@@ -3832,7 +3936,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const plain = sections.join("\n\n");
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
     } catch (error) {
-      const message = `Failed to read Claude usage: ${friendlyErrorText(error)}`;
+      const message = `Failed to read usage: ${friendlyErrorText(error)}`;
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: message,
         messageThreadId,
@@ -4247,6 +4351,42 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     });
   });
 
+  bot.command("saxo_approve", async (ctx) => {
+    if (ctx.chat.type !== "private" || !ctx.from) {
+      await safeReply(ctx, escapeHTML("Saxo approvals are accepted only in Anthony's allowlisted private chat."), {
+        fallbackText: "Saxo approvals are accepted only in Anthony's allowlisted private chat.",
+      });
+      return;
+    }
+    const draftId = getCommandArgument(ctx).trim().toUpperCase();
+    if (!/^S-[A-F0-9]{8}$/u.test(draftId)) {
+      await safeReply(ctx, escapeHTML("Usage: /saxo_approve S-1234ABCD"), {
+        fallbackText: "Usage: /saxo_approve S-1234ABCD",
+      });
+      return;
+    }
+    await safeReply(ctx, escapeHTML(`Submitting approved Saxo SIM draft ${draftId}. LIVE is disabled.`), {
+      fallbackText: `Submitting approved Saxo SIM draft ${draftId}. LIVE is disabled.`,
+    });
+    try {
+      const result = await runSaxoApproval({
+        sender_user_id: ctx.from.id,
+        chat_id: ctx.chat.id,
+        chat_type: ctx.chat.type,
+        allowed_user_ids: config.telegramAllowedUserIds,
+        draft_id: draftId,
+      });
+      const response = result.response && typeof result.response === "object"
+        ? JSON.stringify(result.response)
+        : "No response details returned.";
+      const message = `Saxo SIM ${String(result.action ?? "order")} submitted for ${draftId}. ${response}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    } catch (error) {
+      const message = `Saxo SIM approval failed: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    }
+  });
+
   bot.command(["jobs", "alljobs"], async (ctx) => {
     const text = ctx.message?.text ?? "";
     const wantsAll = /^\/alljobs(?:@\w+)?(?:\s|$)/i.test(text);
@@ -4346,6 +4486,17 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       await flushBufferedPriority(ctx, contextKey, descriptor, parseContextKey(contextKey).messageThreadId);
     }
     if (prompt) {
+      const vendorModelMatch = prompt.match(/^\/model(?:@\w+)?\s+([a-zA-Z0-9_.:-]+)\s*$/u);
+      const vendorHit = vendorModelMatch?.[1]
+        ? resolveVendorModel(vendorModelMatch[1])
+        : null;
+      if (vendorHit) {
+        await handleVendorModelForClaude(ctx, contextKey, vendorHit);
+        return;
+      }
+      if (prompt.startsWith("/") && await handleClaudeSlashCommand(ctx, contextKey, chatId, prompt)) {
+        return;
+      }
       startClaudePrompt(ctx, contextKey, chatId, prompt);
       return;
     }
@@ -5472,8 +5623,48 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
   bot.command("usage", async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
+    const messageThreadId = contextKey
+      ? parseContextKey(contextKey).messageThreadId
+      : undefined;
+
+    // Determine the active vendor model so a third-party subscription (e.g.
+    // QwenCloud) with a registered usage reader reports its own live usage
+    // instead of the dark built-in Codex/Claude panels.
+    const activeModel = contextKey && isClaudeActive(contextKey)
+      ? String(
+          claudeSessions.get(contextKey)?.metadata?.model ??
+            config.claudeDefaultModel,
+        )
+      : registry.getDefaultModel() ?? "";
+    const activeVendor = activeModel
+      ? resolveVendorModel(activeModel)
+      : null;
+    if (activeVendor && hasUsageReader(activeVendor.vendor.id)) {
+      try {
+        const report = await readVendorUsage(activeVendor.vendor.id);
+        const session = contextKey ? registry.get(contextKey) : undefined;
+        const sessionTokens = session?.getInfo().sessionTokens;
+        const sections = [
+          `**${USAGE_READERS[activeVendor.vendor.id].label} usage**\n\n${report}`,
+          sessionTokens ? formatSessionTokensPlain(sessionTokens).replace(/^Session tokens:/u, "Session context tokens:") : undefined,
+        ].filter((section): section is string => Boolean(section));
+        const plain = sections.join("\n\n");
+        await safeReply(ctx, formatTelegramHTML(plain), {
+          fallbackText: plain,
+          messageThreadId,
+        });
+      } catch (error) {
+        const message = `Failed to read ${USAGE_READERS[activeVendor.vendor.id].label} usage: ${friendlyErrorText(error)}`;
+        await safeReply(ctx, escapeHTML(message), {
+          fallbackText: message,
+          messageThreadId,
+        });
+      }
+      return;
+    }
+
     if (contextKey && isClaudeActive(contextKey)) {
-      await sendClaudeUsageReport(ctx, contextKey, parseContextKey(contextKey).messageThreadId);
+      await sendClaudeUsageReport(ctx, contextKey, messageThreadId);
       return;
     }
 
@@ -5504,7 +5695,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const plain = [
         `Codex MCP tools are ${state}.`,
         `Configured servers: ${serverList}.`,
-        "Use /mcp on to enable them (browser and computer-use tools; the next thread start pays their cold start) or /mcp off to keep Codex fast.",
+        "Use /mcp on to enable these optional Codex integrations, or /mcp off to keep Codex fast.",
       ].join("\n");
       await safeReply(ctx, escapeHTML(plain), { fallbackText: plain });
       return;
@@ -7014,6 +7205,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (rawContextKey && isClaudeActive(rawContextKey)) {
       const rawText = ctx.message?.text ?? "";
       const modelArg = rawText.replace(/^\/model(?:@\w+)?\s*/i, "").trim();
+      const vendorHit = modelArg ? resolveVendorModel(modelArg) : null;
+      if (vendorHit) {
+        await handleVendorModelForClaude(ctx, rawContextKey, vendorHit);
+        return;
+      }
       const requestedModel = parseClaudeModelArgument(modelArg);
       const currentDescriptor = claudeSessions.get(rawContextKey);
       const persisted = claudeState?.get(rawContextKey);
@@ -7069,9 +7265,42 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const rawText = ctx.message?.text ?? "";
     const modelArg = rawText.replace(/^\/model(?:@\w+)?\s*/i, "").trim();
     if (modelArg) {
+      // Vendor models are not in the Codex catalog, so they are resolved first.
+      // Naming one switches the endpoint as well as the model.
+      const vendorHit = resolveVendorModel(modelArg);
+      if (vendorHit && vendorHit.model.codex) {
+        if (!isVendorAvailable(vendorHit.vendor, { workspace: config.workspace })) {
+          const text = vendorUnavailableText(vendorHit);
+          await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+          return;
+        }
+        try {
+          session.setModel(vendorHit.model.slug);
+          registry.setDefaultModel(vendorHit.model.slug);
+          updateSessionMetadata(contextKey, session);
+          const text = `Model set to ${describeVendorModel(vendorHit)}. Future new Codex sessions will use it too.`;
+          await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        } catch (error) {
+          await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+            fallbackText: `Failed: ${friendlyErrorText(error)}`,
+          });
+        }
+        return;
+      }
+      if (vendorHit) {
+        // Registered, but this agent CLI cannot drive it. Saying so beats the
+        // generic "unknown model", which would imply a typo.
+        const text = `${vendorHit.model.slug} is not available for Codex sessions. Use /provider claude for it.`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+
       const slug = resolveModelSlug(modelArg, models);
       if (!slug) {
-        const available = models.map((m) => m.slug).join(", ");
+        const available = [
+          ...models.map((m) => m.slug),
+          ...listVendorModels().filter((m) => m.codex).map((m) => m.slug),
+        ].join(", ");
         const text = `Unknown model "${modelArg}". Available: ${available}`;
         await safeReply(ctx, escapeHTML(text), { fallbackText: text });
         return;
@@ -8161,6 +8390,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "start", description: "Welcome & status" },
     { command: "help", description: "Command reference" },
     { command: "health", description: "Bot health summary" },
+    { command: "saxo_approve", description: "Approve one frozen Saxo SIM draft" },
     { command: "claude", description: "Switch this context to Claude Code" },
     { command: "codex", description: "Switch this context to Codex" },
     { command: "provider", description: "Show or set default provider" },
@@ -8176,7 +8406,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "session", description: "Current thread details" },
     { command: "status", description: "Current thread details" },
     { command: "usage", description: "Codex limits & reset times" },
-    { command: "mcp", description: "Toggle Codex MCP tools (browser/computer use)" },
+    { command: "mcp", description: "Toggle optional Codex MCP integrations" },
     { command: "backend", description: "Show or reset backend" },
     { command: "verbosity", description: "Set progress delivery" },
     { command: "appserver", description: "Probe Codex app-server" },
@@ -9169,6 +9399,13 @@ function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName
 
   const dotted = models.find((model) => normalizeModelName(model.slug).endsWith(normalized));
   return dotted?.slug ?? null;
+}
+
+function vendorUnavailableText(vendorHit: NonNullable<ReturnType<typeof resolveVendorModel>>): string {
+  return [
+    `${describeVendorModel(vendorHit)} has no credential yet.`,
+    `Set ${vendorHit.vendor.apiKeyEnv}, or add "${vendorHit.vendor.id}" to ${VENDOR_CREDENTIALS_FILENAME} in the workspace.`,
+  ].join(" ");
 }
 
 function getCommandArgument(ctx: Context): string {

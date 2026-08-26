@@ -3,16 +3,16 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 /**
- * Runtime toggle for the MCP servers configured in ~/.codex/config.toml
- * (Hermes browser tools, cua-driver computer use, ...). Those servers cold-start
+ * Runtime toggle for enabled MCP servers configured in ~/.codex/config.toml.
+ * Those servers cold-start
  * on every Codex thread start/resume (measured >15s) and their tool schemas are
  * injected into every turn, so they stay OFF by default and are enabled on
  * demand via /mcp on.
  *
  * When OFF, every codex spawn gets `-c mcp_servers.<name>.enabled=false` for
- * each server actually present in config.toml. Names are read from the file at
- * spawn time because disabling a name that is not configured makes Codex fail
- * config loading entirely ("invalid transport").
+ * each server not already disabled in config.toml. Names are read from the file
+ * at spawn time because disabling a name that is not configured makes Codex
+ * fail config loading entirely ("invalid transport").
  */
 
 let mcpEnabled = false;
@@ -43,23 +43,31 @@ export function listConfiguredCodexMcpServers(): string[] {
     return [];
   }
 
-  const names = new Set<string>();
+  const enabledByName = new Map<string, boolean>();
+  let currentServer: string | null = null;
   for (const line of text.split(/\r?\n/)) {
     const match = line.match(/^\s*\[mcp_servers\.(.+)\]\s*(?:#.*)?$/);
-    if (!match || !match[1]) {
+    if (match?.[1]) {
+      const rawKey = match[1].trim();
+      const name = firstKeySegment(rawKey);
+      currentServer = name && isBaseServerTable(rawKey) ? name : null;
+      if (currentServer && !enabledByName.has(currentServer)) {
+        enabledByName.set(currentServer, true);
+      }
       continue;
     }
-    const name = firstKeySegment(match[1].trim());
-    if (name) {
-      names.add(name);
+    if (currentServer && /^\s*enabled\s*=\s*false\s*(?:#.*)?$/i.test(line)) {
+      enabledByName.set(currentServer, false);
     }
   }
-  return [...names];
+  return [...enabledByName.entries()]
+    .filter(([, enabled]) => enabled)
+    .map(([name]) => name);
 }
 
 /**
- * Extra `codex` CLI args that disable every configured MCP server. Empty when
- * the toggle is ON (config.toml applies as-is).
+ * Extra `codex` CLI args that disable every eligible MCP server. Empty when the
+ * toggle is ON (config.toml applies as-is).
  */
 export function buildCodexMcpOverrideArgs(): string[] {
   if (mcpEnabled) {
@@ -107,4 +115,13 @@ function firstKeySegment(raw: string): string | null {
   const dot = raw.indexOf(".");
   const name = (dot === -1 ? raw : raw.slice(0, dot)).trim();
   return name || null;
+}
+
+function isBaseServerTable(raw: string): boolean {
+  const quote = raw[0];
+  if (quote === "'" || quote === '"') {
+    const end = raw.indexOf(quote, 1);
+    return end > 1 && raw.slice(end + 1).trim() === "";
+  }
+  return !raw.includes(".");
 }

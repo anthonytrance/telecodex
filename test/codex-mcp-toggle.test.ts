@@ -24,6 +24,7 @@ url = "https://developers.openai.com/mcp"
 [mcp_servers.hermes-tools]
 command = 'C:\\python.exe'
 args = ["-m", "server"]
+enabled = false
 
 [mcp_servers.hermes-tools.env]
 PYTHONPATH = 'C:\\hermes'
@@ -53,10 +54,9 @@ describe("codex-mcp-toggle", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("lists each configured server once, ignoring nested tables and handling quoted names", () => {
+  it("lists enabled servers once, ignoring disabled and nested tables and handling quoted names", () => {
     writeFileSync(path.join(tempDir, "config.toml"), SAMPLE_CONFIG, "utf8");
     expect(listConfiguredCodexMcpServers().sort()).toEqual([
-      "hermes-tools",
       "openaiDeveloperDocs",
       "quoted.name",
     ]);
@@ -70,10 +70,9 @@ describe("codex-mcp-toggle", () => {
   it("builds -c disable args for every server when the toggle is off", () => {
     writeFileSync(path.join(tempDir, "config.toml"), SAMPLE_CONFIG, "utf8");
     const args = buildCodexMcpOverrideArgs();
-    expect(args).toContain("mcp_servers.hermes-tools.enabled=false");
     expect(args).toContain("mcp_servers.openaiDeveloperDocs.enabled=false");
     expect(args).toContain('mcp_servers."quoted.name".enabled=false');
-    expect(args.filter((arg) => arg === "-c")).toHaveLength(3);
+    expect(args.filter((arg) => arg === "-c")).toHaveLength(2);
   });
 
   it("builds no overrides when the toggle is on", () => {
@@ -87,7 +86,6 @@ describe("codex-mcp-toggle", () => {
   it("builds SDK config override entries when the toggle is off", () => {
     writeFileSync(path.join(tempDir, "config.toml"), SAMPLE_CONFIG, "utf8");
     expect(buildCodexMcpOverrideConfig()).toEqual({
-      "mcp_servers.hermes-tools.enabled": false,
       "mcp_servers.openaiDeveloperDocs.enabled": false,
       'mcp_servers."quoted.name".enabled': false,
     });

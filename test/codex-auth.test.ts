@@ -64,6 +64,7 @@ describe("codex-auth", () => {
       expect(status.authenticated).toBe(true);
       expect(status.method).toBe("cli");
       expect(status.detail).toContain("user@example.com");
+      expect(mockExecFile.mock.calls[0]?.[2]).toMatchObject({ windowsHide: true });
     });
 
     it("reports unauthenticated when CLI auth fails", async () => {

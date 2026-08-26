@@ -64,7 +64,7 @@ describe("voice decoding", () => {
     expect(spawnMock).toHaveBeenCalledWith(
       "ffmpeg",
       ["-i", "/tmp/sample.ogg", "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
     );
     expect(result).toMatchObject({
       text: "decoded locally",

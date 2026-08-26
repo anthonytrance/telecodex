@@ -123,6 +123,7 @@ function runCodexCommand(args: string[]): Promise<{ stdout: string; stderr: stri
         timeout: COMMAND_TIMEOUT_MS,
         env: { ...process.env },
         maxBuffer: 1024 * 1024,
+        windowsHide: true,
       },
       (error, stdout, stderr) => {
         if (error) {

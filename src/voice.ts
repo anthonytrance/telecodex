@@ -124,6 +124,7 @@ function transcribeWithFasterWhisper(filePath: string): Promise<TranscriptionRes
         PYTHONIOENCODING: "utf-8",
       },
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -251,6 +252,7 @@ function decodeAudioToSamples(filePath: string): Promise<Float32Array> {
 
     const ffmpeg = spawn("ffmpeg", ["-i", filePath, "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"], {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     const finish = (callback: () => void): void => {

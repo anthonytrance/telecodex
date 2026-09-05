@@ -114,6 +114,8 @@ export type AgentProviderEvent =
       sessionId: string;
       jobId?: string;
       text: string;
+      /** Deliver immediately even when this provider is running in the background. */
+      priority?: boolean;
     }
   | {
       type: "session_title_changed";

@@ -1,5 +1,10 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
   ClaudeSdkInputController,
+  recoverSdkContextFromTranscript,
   runClaudeSdkCompact,
   runClaudeSdkTurn,
   type SdkMessageLike,
@@ -158,6 +163,33 @@ describe("claude sdk engine", () => {
       sessionId: baseOptions.sessionId,
       summary: "Compacted: 210,000 -> 8,500 tokens",
       postTokens: 8500,
+    });
+  });
+
+  it("surfaces SDK model fallbacks as immediate detailed status events", async () => {
+    const { queryFn } = fakeQuery([
+      { type: "system", subtype: "init", session_id: "s" },
+      {
+        type: "system",
+        subtype: "model_refusal_fallback",
+        session_id: "s",
+        original_model: "claude-fable-5-1",
+        fallback_model: "claude-opus-4-8",
+        api_refusal_category: "cyber",
+        scope: "session",
+        content: "Fable safeguards flagged this message.",
+      },
+      { type: "result", subtype: "success", result: "continued safely", usage: {} },
+    ]);
+
+    const events = await collect(runClaudeSdkTurn({ ...baseOptions, queryFn }));
+
+    expect(events).toContainEqual({
+      type: "status_message",
+      sessionId: baseOptions.sessionId,
+      jobId: baseOptions.jobId,
+      text: "Claude model fallback: Fable 5.1 switched to Opus 4.8. Reason: cyber safeguards. This session will continue on Opus 4.8.",
+      priority: true,
     });
   });
 
@@ -519,5 +551,62 @@ describe("claude sdk engine", () => {
       type: "error",
       message: expect.stringContaining("without a result"),
     });
+  });
+});
+
+describe("recoverSdkContextFromTranscript", () => {
+  it("reads the last real per-call usage from the session transcript", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tc-sdk-ctx-"));
+    try {
+      const sessionId = "test-session-1";
+      const projectDir = join(root, "projects", "demo");
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(
+        join(projectDir, `${sessionId}.jsonl`),
+        [
+          JSON.stringify({ type: "user", message: { role: "user", content: "hi" } }),
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              usage: {
+                input_tokens: 400,
+                cache_read_input_tokens: 1000,
+                cache_creation_input_tokens: 0,
+                output_tokens: 50,
+              },
+            },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              // Z.AI-style zeroed block: must be skipped, not counted.
+              usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 },
+            },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              usage: {
+                input_tokens: 500,
+                cache_read_input_tokens: 78464,
+                cache_creation_input_tokens: 0,
+                output_tokens: 300,
+              },
+            },
+          }),
+        ].join("\n") + "\n",
+      );
+      const recovered = await recoverSdkContextFromTranscript(sessionId, [root]);
+      expect(recovered).toBe(79264);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined when no transcript exists", async () => {
+    const missing = await recoverSdkContextFromTranscript("missing-session", [
+      join(tmpdir(), "tc-definitely-not-here"),
+    ]);
+    expect(missing).toBeUndefined();
   });
 });

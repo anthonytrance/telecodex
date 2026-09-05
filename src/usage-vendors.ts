@@ -27,6 +27,8 @@ export const QWEN_READER_PYTHON = join(
   "python.exe",
 );
 export const QWEN_READER_SCRIPT = join(homedir(), "codetest", "qwen_usage.py");
+/** Z.AI GLM Coding Plan reader (queries Z.AI's monitor endpoints). */
+export const GLM_READER_SCRIPT = join(homedir(), "codetest", "glm_usage.py");
 
 export interface UsageReader {
   /** Human label shown at the top of the report. */
@@ -46,6 +48,11 @@ export const USAGE_READERS: Record<string, UsageReader> = {
   modelstudio: {
     label: "QwenCloud Token Plan",
     cmd: [QWEN_READER_PYTHON, QWEN_READER_SCRIPT],
+    timeout: 60,
+  },
+  zai: {
+    label: "Z.AI GLM Coding Plan",
+    cmd: [QWEN_READER_PYTHON, GLM_READER_SCRIPT],
     timeout: 60,
   },
 };

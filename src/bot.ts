@@ -17,6 +17,7 @@ import {
   listVendorModels,
   resolveVendorModel,
   VENDOR_CREDENTIALS_FILENAME,
+  vendorReasoningEffortsForModel,
 } from "./model-vendors.js";
 import { ClaudeBackendPrefs, claudeBackendPrefsPath, type ClaudeBackendChoice } from "./claude-backend-prefs.js";
 import {
@@ -85,6 +86,7 @@ import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { applyGoalModeConstraints, formatThreadGoal, parseGoalModeArgument } from "./goal-mode.js";
 import { OutputBuffer, type BufferedOutputEvent } from "./output-buffer.js";
 import {
+  addRequiredNativeReasoningEfforts,
   CODEX_REASONING_EFFORTS,
   LEGACY_CODEX_REASONING_EFFORTS,
   isCodexReasoningEffort,
@@ -3041,13 +3043,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }, NARRATION_IDLE_FLUSH_MS);
     };
 
-    const deliverClaudeStatusMessage = async (message: string): Promise<void> => {
+    const deliverClaudeStatusMessage = async (message: string, priority = false): Promise<void> => {
       const trimmed = message.trim();
       if (!trimmed) {
         return;
       }
       const quietWarning = isClaudeQuietWarning(trimmed);
-      if (quietWarning || isProviderForeground(contextKey, "claude")) {
+      if (priority || quietWarning || isProviderForeground(contextKey, "claude")) {
         await replyToClaudeRunSource(source, escapeHTML(trimmed), {
           fallbackText: trimmed,
           messageThreadId,
@@ -3130,8 +3132,15 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             }
             break;
           case "status_message":
-            await flushPendingClaudeAssistantProgress();
-            await deliverClaudeStatusMessage(event.text);
+            if (event.priority) {
+              // Model fallbacks and refusals must reach Telegram before any held
+              // narration, even if Claude is currently running in the background.
+              await deliverClaudeStatusMessage(event.text, true);
+              await flushPendingClaudeAssistantProgress();
+            } else {
+              await flushPendingClaudeAssistantProgress();
+              await deliverClaudeStatusMessage(event.text);
+            }
             break;
           case "tool_failed": {
             await flushPendingClaudeAssistantProgress();
@@ -9426,9 +9435,17 @@ function reasoningEffortsForSession(session: CodexSessionRuntime): CodexReasonin
   const model = currentModel
     ? session.listModels().find((candidate) => candidate.slug === currentModel)
     : undefined;
-  return model?.supportedReasoningEfforts?.length
-    ? [...model.supportedReasoningEfforts]
-    : [...LEGACY_CODEX_REASONING_EFFORTS];
+  if (model?.supportedReasoningEfforts?.length) {
+    return addRequiredNativeReasoningEfforts(currentModel, model.supportedReasoningEfforts);
+  }
+  // Codex's shared models_cache.json is written by whichever child last listed
+  // models, so it can hold the built-in catalog while this session runs on a
+  // vendor catalog. Fall back to the vendor's own catalog before the legacy list.
+  const vendorEfforts = currentModel ? vendorReasoningEffortsForModel(currentModel) : null;
+  if (vendorEfforts?.length) {
+    return [...vendorEfforts];
+  }
+  return addRequiredNativeReasoningEfforts(currentModel, LEGACY_CODEX_REASONING_EFFORTS);
 }
 
 function stripTerminalText(text: string): string {

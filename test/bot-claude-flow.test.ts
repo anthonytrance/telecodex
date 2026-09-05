@@ -626,6 +626,42 @@ describe("Claude bot flow", () => {
     );
   });
 
+  it("delivers priority Claude fallback notices immediately while Claude is backgrounded", async () => {
+    const { bot, sent, registry } = await createTestBot(tempDir);
+    mockClaude.blockNextPrompt();
+    mockClaude.setNextEvents([
+      {
+        type: "status_message",
+        sessionId: "claude-provider-1",
+        jobId: "job-1",
+        text: "Claude model fallback: Fable 5.1 switched to Opus 4.8. Reason: cyber safeguards. This session will continue on Opus 4.8.",
+        priority: true,
+      },
+      {
+        type: "assistant_text_delta",
+        sessionId: "claude-provider-1",
+        jobId: "job-1",
+        text: "BACKGROUND_FINAL",
+      },
+      {
+        type: "assistant_message_complete",
+        sessionId: "claude-provider-1",
+        jobId: "job-1",
+        text: "BACKGROUND_FINAL",
+      },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude guarded task"));
+    await waitFor(() => mockClaude.prompts.includes("guarded task"));
+    registry.setActiveProvider("123", "codex");
+    mockClaude.releaseBlockedPrompt();
+
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Claude model fallback:")));
+    expect(sent.map((entry) => entry.text)).toContain(
+      "Claude model fallback: Fable 5.1 switched to Opus 4.8. Reason: cyber safeguards. This session will continue on Opus 4.8.",
+    );
+  });
+
   it("keeps background commentary quiet, delivers the full final, and replays commentary only on command", async () => {
     const { bot, sent, registry } = await createTestBot(tempDir);
     const finalText = `FULL_FINAL ${"x".repeat(900)}`;

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ import {
   resolveVendorApiKey,
   resolveVendorModel,
   VENDOR_CREDENTIALS_FILENAME,
+  vendorReasoningEffortsForModel,
 } from "../src/model-vendors.js";
 import { buildClaudePtyEnv } from "../src/providers/claude-pty.js";
 
@@ -123,6 +124,23 @@ describe("codex vendor wiring", () => {
     expect(config.model_catalog_json).toMatch(/model-catalog\.qwen\.json$/);
   });
 
+  it("reads advertised efforts from the vendor catalog, not the shared cache", () => {
+    const catalogPath = buildVendorCodexConfig(requireResolved("qwen")).model_catalog_json;
+    const efforts = vendorReasoningEffortsForModel("qwen");
+    if (existsSync(catalogPath)) {
+      expect(efforts).toContain("max");
+      expect(efforts).toContain("xhigh");
+      expect(vendorReasoningEffortsForModel("qwen3.8-max")).toEqual(efforts);
+    } else {
+      expect(efforts).toBeNull();
+    }
+  });
+
+  it("returns null for native models so the legacy fallback still applies", () => {
+    expect(vendorReasoningEffortsForModel("gpt-5.6-terra")).toBeNull();
+    expect(vendorReasoningEffortsForModel("")).toBeNull();
+  });
+
   it("carries the vendor key under the env var the provider table reads", () => {
     const resolved = requireResolved("qwen");
     const env = buildVendorCodexEnv(resolved, { env: { DASHSCOPE_API_KEY: "sk-test" } });
@@ -200,5 +218,65 @@ describe("claude vendor wiring", () => {
     expect(built.CLAUDE_CODE_SOMETHING).toBeUndefined();
     expect(built.ANTHROPIC_AUTH_TOKEN).toBe("sk-test");
     expect(built.PATH).toBe("/usr/bin");
+  });
+});
+
+describe("zai vendor wiring", () => {
+  it("resolves the zai models by slug and every alias without touching qwen's", () => {
+    for (const name of ["glm-5.3", "glm53", "glm5.3", "zai"]) {
+      expect(resolveVendorModel(name)?.model.slug).toBe("glm-5.3");
+      expect(resolveVendorModel(name)?.vendor.id).toBe("zai");
+    }
+    for (const name of ["glm-5.3-flash", "glmflash", "glm53flash", "glm5.3flash"]) {
+      expect(resolveVendorModel(name)?.model.slug).toBe("glm-5.3-flash");
+      expect(resolveVendorModel(name)?.vendor.id).toBe("zai");
+    }
+    // QwenCloud keeps its glm-5.2 slug and the glm52 alias; "glm" now
+    // points at Z.AI glm-5.3 (user request, 2026-08-28).
+    expect(resolveVendorModel("glm")?.model.slug).toBe("glm-5.3");
+    expect(resolveVendorModel("glm")?.vendor.id).toBe("zai");
+    expect(resolveVendorModel("glm52")?.model.slug).toBe("glm-5.2");
+    expect(resolveVendorModel("glm52")?.vendor.id).toBe("modelstudio");
+  });
+
+  it("points the Codex provider at the Responses endpoint with the GLM catalog", () => {
+    const config = buildVendorCodexConfig(requireResolved("glmflash"));
+    expect(config.model_provider).toBe("zai");
+    expect(config.model_catalog_json).toMatch(/model-catalog\.glm\.json$/);
+    const efforts = vendorReasoningEffortsForModel("glmflash");
+    if (existsSync(config.model_catalog_json)) {
+      expect(efforts).toContain("low");
+      expect(efforts).toContain("high");
+      expect(efforts).toContain("max");
+    } else {
+      expect(efforts).toBeNull();
+    }
+  });
+
+  it("pins the Claude slots to the requested model with flash on the Haiku slot", () => {
+    const env = buildVendorClaudeSettingsEnv(requireResolved("glm53"));
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://api.z.ai/api/anthropic");
+    expect(env.ANTHROPIC_MODEL).toBe("glm-5.3");
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("glm-5.3-flash");
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("1000000");
+    // Same rule as every vendor: the token never rides the settings overlay.
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  });
+
+  it("carries the GLM key as ANTHROPIC_AUTH_TOKEN and survives the PTY scrub", () => {
+    const resolved = requireResolved("glmflash");
+    const env = buildVendorClaudeEnv(resolved, { env: { GLM_API_KEY: "zai-test" } });
+    expect(env).toEqual({ ANTHROPIC_AUTH_TOKEN: "zai-test" });
+    const built = buildClaudePtyEnv(
+      {
+        bin: "claude",
+        args: [],
+        cwd: "C:\\workspace",
+        extraEnv: env,
+      },
+      { CLAUDE_CODE_SOMETHING: "stripped", PATH: "/usr/bin" },
+    );
+    expect(built.CLAUDE_CODE_SOMETHING).toBeUndefined();
+    expect(built.ANTHROPIC_AUTH_TOKEN).toBe("zai-test");
   });
 });

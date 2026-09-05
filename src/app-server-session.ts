@@ -27,6 +27,7 @@ import {
   listModels,
   listThreads,
   listWorkspaces,
+  readThreadHistory,
   type CodexModelRecord,
   type CodexThreadRecord,
 } from "./codex-state.js";
@@ -96,12 +97,19 @@ type AppServerCreateOptions = CreateOptions & {
 const ABORT_SETTLE_GRACE_MS = 750;
 const ABORT_INTERRUPT_TIMEOUT_MS = 3_000;
 const GOAL_IDLE_PROGRESS_MS = 5 * 60_000;
+const PROVIDER_HANDOFF_HISTORY_LIMIT = 16;
+const PROVIDER_HANDOFF_MESSAGE_CHAR_LIMIT = 12_000;
+const PROVIDER_HANDOFF_TOTAL_CHAR_LIMIT = 80_000;
 // Starting or resuming a thread can initialize configured MCP servers. The
 // normal 15-second RPC timeout is too short when external servers such as the
 // Hermes browser bridge and cua-driver are starting cold.
 const THREAD_LIFECYCLE_TIMEOUT_MS = 60_000;
 
 type ActiveRunKind = "prompt" | "goal";
+
+type ProviderHandoff = {
+  sourceThreadId: string;
+};
 
 export class AppServerSessionService {
   private client: AppServerClientLike | null = null;
@@ -120,6 +128,7 @@ export class AppServerSessionService {
   private activeReject: ((error: Error) => void) | null = null;
   private activeGoal: CodexThreadGoal | null = null;
   private activeGoalCleared = false;
+  private pendingProviderHandoff: ProviderHandoff | null = null;
   private goalIdleTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly agentTextByPhase = new Map<string, string>();
   private readonly lastCommandOutput = new Map<string, string>();
@@ -209,6 +218,32 @@ export class AppServerSessionService {
   }
 
   async prompt(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
+    let recoveredNonPortableHistory = false;
+    while (true) {
+      try {
+        await this.promptOnce(input, callbacks);
+        return;
+      } catch (error) {
+        if (
+          recoveredNonPortableHistory ||
+          !isNonPortableResponseItemIdError(error) ||
+          !this.currentThreadId
+        ) {
+          throw error;
+        }
+
+        const sourceThreadId = this.currentThreadId;
+        this.pendingProviderHandoff = { sourceThreadId };
+        this.currentThreadId = null;
+        this.appServerAttachedThreadId = null;
+        this.activeThreadLaunchProfile = null;
+        await this.newThread(this.currentWorkspace, this.currentModel);
+        recoveredNonPortableHistory = true;
+      }
+    }
+  }
+
+  private async promptOnce(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
     if (!this.currentThreadId) {
       throw new Error("Codex thread is not initialized");
     }
@@ -225,6 +260,7 @@ export class AppServerSessionService {
     });
 
     try {
+      const includedHandoff = this.pendingProviderHandoff;
       const response = await this.requestCurrentThread<{ turn: AppServerTurn }>("turn/start", (threadId) => ({
         threadId,
         input: this.buildAppServerInput(input),
@@ -233,6 +269,9 @@ export class AppServerSessionService {
         model: this.currentModel ?? null,
         effort: this.currentReasoningEffort ?? null,
       }));
+      if (includedHandoff && this.pendingProviderHandoff === includedHandoff) {
+        this.pendingProviderHandoff = null;
+      }
       this.activeTurnId = response.turn.id;
       await completed;
     } finally {
@@ -649,7 +688,22 @@ export class AppServerSessionService {
 
   setModel(slug: string): string {
     this.ensureIdle("change model");
+    const previousVendorId = this.currentVendor?.vendor.id ?? null;
+    const sourceThreadId = this.currentThreadId;
     this.applyModel(slug);
+    const nextVendorId = this.currentVendor?.vendor.id ?? null;
+    if (sourceThreadId && previousVendorId !== nextVendorId) {
+      // Responses item IDs and encrypted reasoning state belong to the provider
+      // that created them. Replaying a Qwen/other-vendor rollout directly to
+      // OpenAI produces hard 400s such as a reasoning item with a msg_ ID where
+      // OpenAI requires rs_. Keep the source rollout intact and carry only the
+      // portable visible conversation into a clean target-provider thread.
+      this.pendingProviderHandoff = { sourceThreadId };
+      this.currentThreadId = null;
+      this.appServerAttachedThreadId = null;
+      this.activeThreadLaunchProfile = null;
+      this.resetSessionTokens();
+    }
     return slug;
   }
 
@@ -1158,14 +1212,21 @@ export class AppServerSessionService {
   }
 
   private buildAppServerInput(input: CodexPromptInput): JsonValue[] {
+    const handoffText = this.pendingProviderHandoff
+      ? this.buildProviderHandoffText(this.pendingProviderHandoff, input)
+      : null;
     if (typeof input === "string") {
-      return [{ type: "text", text: input, text_elements: [] }];
+      return [{
+        type: "text",
+        text: [input, handoffText].filter(Boolean).join("\n\n"),
+        text_elements: [],
+      }];
     }
 
     const result: JsonValue[] = [];
     // User text first: Codex titles threads from the start of the first message,
     // so the staged-file/output instructions must not lead the prompt.
-    const textParts = [input.text, input.stagedFileInstructions].filter(
+    const textParts = [input.text, handoffText, input.stagedFileInstructions].filter(
       (value): value is string => typeof value === "string" && value.length > 0,
     );
     if (textParts.length > 0) {
@@ -1175,6 +1236,44 @@ export class AppServerSessionService {
       result.push({ type: "localImage", path: imagePath });
     }
     return result.length > 0 ? result : [{ type: "text", text: "", text_elements: [] }];
+  }
+
+  private buildProviderHandoffText(handoff: ProviderHandoff, input: CodexPromptInput): string {
+    const history = readThreadHistory(handoff.sourceThreadId, PROVIDER_HANDOFF_HISTORY_LIMIT);
+    const currentText = promptInputText(input).trim();
+    if (
+      currentText &&
+      history.at(-1)?.role === "user" &&
+      normalizeHandoffText(history.at(-1)?.text ?? "") === normalizeHandoffText(currentText)
+    ) {
+      // The app-server persists the user item before an upstream 400. Do not
+      // duplicate that failed message when retrying it on the clean thread.
+      history.pop();
+    }
+
+    let remaining = PROVIDER_HANDOFF_TOTAL_CHAR_LIMIT;
+    const copied: Array<{ role: "user" | "assistant"; text: string }> = [];
+    for (const message of [...history].reverse()) {
+      if (remaining <= 0) {
+        break;
+      }
+      const text = message.text.slice(0, Math.min(PROVIDER_HANDOFF_MESSAGE_CHAR_LIMIT, remaining));
+      if (!text) {
+        continue;
+      }
+      copied.push({ role: message.role, text });
+      remaining -= text.length;
+    }
+    copied.reverse();
+
+    return [
+      "<telecode_cross_provider_handoff>",
+      "TeleCode created a clean Codex thread because raw Responses history contains provider-specific item IDs and reasoning state that cannot safely be replayed across model vendors.",
+      `The original source thread is preserved and resumable: ${handoff.sourceThreadId}`,
+      "The user's current message appears above this block and remains authoritative. The JSON lines below are recent visible conversation copied from the source rollout as prior context. Inspect the workspace and source thread when more detail is needed.",
+      ...copied.map((message) => JSON.stringify(message)),
+      "</telecode_cross_provider_handoff>",
+    ].join("\n");
   }
 
   private ensureIdle(action: string): void {
@@ -1240,6 +1339,24 @@ function isActiveGoal(goal: CodexThreadGoal): boolean {
 
 function isThreadNotFoundError(error: unknown): boolean {
   return /\bthread not found\b/i.test(formatErrorMessage(error));
+}
+
+function isNonPortableResponseItemIdError(error: unknown): boolean {
+  const message = formatErrorMessage(error);
+  return /invalid_id_prefix/i.test(message) && /Expected an ID that begins with ['"][a-z]+/i.test(message);
+}
+
+function promptInputText(input: CodexPromptInput): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  return [input.text, input.stagedFileInstructions]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .join("\n\n");
+}
+
+function normalizeHandoffText(text: string): string {
+  return text.split(String.fromCharCode(13)).join("").trim();
 }
 
 function getNotificationItem(notification: AppServerNotification): AppServerThreadItem | null {

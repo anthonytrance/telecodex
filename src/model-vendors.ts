@@ -19,6 +19,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isCodexReasoningEffort, type CodexReasoningEffort } from "./reasoning-effort.js";
+
 /** Where per-vendor API keys live, as a flat { vendorId: key } JSON object. */
 export const VENDOR_CREDENTIALS_FILENAME = "model_vendor_credentials.json";
 
@@ -86,6 +88,30 @@ const VENDORS: ModelVendor[] = [
       haikuModel: "qwen3.6-flash",
     },
   },
+  {
+    // Z.AI GLM Coding Plan (Lite). The key only works on the Coding Plan
+    // endpoints; the general /api/paas/v4 host rejects it with 1113
+    // "Insufficient balance" (verified 2026-08-28). Codex speaks the dedicated
+    // OpenAI Responses endpoint; Claude Code speaks the Anthropic-compatible
+    // one, which accepts the same key via Authorization: Bearer.
+    id: "zai",
+    label: "Z.AI GLM Coding Plan",
+    apiKeyEnv: "GLM_API_KEY",
+    codex: {
+      providerId: "zai",
+      config: {
+        // Same REPLACES-not-merges rule as the Qwen catalog above: never
+        // global, only merged into sessions already resolved to this vendor.
+        model_catalog_json: join(homedir(), ".codex", "model-catalog.glm.json"),
+      },
+    },
+    claude: {
+      baseUrl: "https://api.z.ai/api/anthropic",
+      // Flash is the cheap model on the plan; keep background Haiku-slot work
+      // off the flagship.
+      haikuModel: "glm-5.3-flash",
+    },
+  },
 ];
 
 /**
@@ -126,7 +152,7 @@ const VENDOR_MODELS: VendorModel[] = [
   {
     slug: "glm-5.2",
     vendorId: "modelstudio",
-    aliases: ["glm", "glm52"],
+    aliases: ["glm52"],
     codex: true,
     claude: true,
   },
@@ -144,6 +170,27 @@ const VENDOR_MODELS: VendorModel[] = [
     // The plan's own model table marks this one "Responses API not yet
     // supported", and Codex speaks nothing else since it dropped wire_api="chat".
     codex: false,
+    claude: true,
+  },
+
+  // Z.AI GLM Coding Plan (registered from the plan's model table, verified
+  // 2026-08-28: both slugs live on /api/v1 Responses and /api/anthropic).
+  // "glm"/"glm52" lived on QwenCloud until 2026-08-28; "glm" now points at
+  // Z.AI glm-5.3 per user request (glm-5.2 keeps "glm52" on QwenCloud).
+  {
+    slug: "glm-5.3",
+    vendorId: "zai",
+    aliases: ["glm", "glm53", "glm5.3", "zai"],
+    contextWindow: 1_000_000,
+    codex: true,
+    claude: true,
+  },
+  {
+    slug: "glm-5.3-flash",
+    vendorId: "zai",
+    aliases: ["glmflash", "glm53flash", "glm5.3flash"],
+    contextWindow: 1_000_000,
+    codex: true,
     claude: true,
   },
 ];
@@ -242,6 +289,40 @@ export function buildVendorCodexEnv(
 ): Record<string, string> {
   const key = resolveVendorApiKey(resolved.vendor, options);
   return key ? { [resolved.vendor.apiKeyEnv]: key } : {};
+}
+
+/**
+ * Reasoning efforts the vendor's own Codex catalog advertises for a model, or
+ * null when the model is not a vendor model, the vendor has no catalog, or the
+ * catalog cannot be read.
+ *
+ * Needed because `codex-state.ts`'s `listModels()` reads Codex's shared
+ * `models_cache.json`, which is written by whichever Codex child last listed
+ * models. That cache can hold the built-in OpenAI catalog while the session is
+ * actually running on a vendor catalog, which would otherwise leave vendor
+ * models with no advertised efforts at all.
+ */
+export function vendorReasoningEffortsForModel(raw: string): CodexReasoningEffort[] | null {
+  const resolved = resolveVendorModel(raw);
+  if (!resolved) {
+    return null;
+  }
+  const catalogPath = resolved.vendor.codex?.config?.model_catalog_json;
+  if (!catalogPath || !existsSync(catalogPath)) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(readFileSync(catalogPath, "utf8")) as {
+      models?: Array<{ slug?: unknown; supported_reasoning_levels?: Array<{ effort?: unknown }> }>;
+    };
+    const entry = (payload.models ?? []).find((model) => model?.slug === resolved.model.slug);
+    const efforts = (entry?.supported_reasoning_levels ?? [])
+      .map((level) => level?.effort)
+      .filter(isCodexReasoningEffort);
+    return efforts.length > 0 ? efforts : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

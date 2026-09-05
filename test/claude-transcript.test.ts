@@ -99,6 +99,28 @@ describe("Claude transcript projection", () => {
         type: "status_message",
         sessionId: "s1",
         text: "Claude Fable refused this request and Claude switched to a fallback model.",
+        priority: true,
+      },
+    ]);
+  });
+
+  it("formats structured model fallbacks with the models, reason, and session scope", () => {
+    const projection = projectClaudeTranscriptEntry({
+      type: "system",
+      subtype: "model_refusal_fallback",
+      originalModel: "claude-fable-5-1",
+      fallbackModel: "claude-opus-4-8",
+      apiRefusalCategory: "cyber",
+      scope: "session",
+      content: "A longer provider-authored fallback explanation.",
+    }, { sessionId: "s1", jobId: "j1" });
+
+    expect(projection.events).toEqual([
+      {
+        type: "status_message",
+        sessionId: "s1",
+        text: "Claude model fallback: Fable 5.1 switched to Opus 4.8. Reason: cyber safeguards. This session will continue on Opus 4.8.",
+        priority: true,
       },
     ]);
   });

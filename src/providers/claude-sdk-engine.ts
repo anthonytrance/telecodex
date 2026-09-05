@@ -5,6 +5,10 @@ import {
   buildVendorClaudeSettingsEnv,
   resolveVendorModel,
 } from "../model-vendors.js";
+import {
+  extractSystemNoticeText,
+  isPriorityClaudeSystemNoticeSubtype,
+} from "./claude-transcript.js";
 import type { AgentProviderEvent } from "./types.js";
 
 /**
@@ -79,6 +83,14 @@ export interface SdkMessageLike {
   type: string;
   subtype?: string;
   session_id?: string;
+  content?: string;
+  text?: string;
+  notice?: string;
+  original_model?: string;
+  fallback_model?: string;
+  api_refusal_category?: string | null;
+  api_refusal_explanation?: string | null;
+  scope?: "session" | "local";
   message?: {
     model?: string;
     content?: Array<Record<string, unknown>>;
@@ -167,6 +179,84 @@ export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLik
   }
 }
 
+/**
+ * Last-resort live-context recovery for vendors whose Anthropic-compatible
+ * stream zeroes usage on every assistant message (Z.AI GLM does; verified
+ * 2026-08-29): the live tracker above never engages, and the only real
+ * per-call numbers are the usage blocks the CLI writes into the session
+ * transcript. Read the LAST such block and return its prompt+completion
+ * size, which is the live context at the end of the turn. Turn totals from
+ * the stream's result message must never stand in for it: they re-count the
+ * cached prefix on every API call and reach millions of tokens on long turns.
+ */
+export async function recoverSdkContextFromTranscript(
+  providerSessionId: string,
+  configDirs?: Array<string | undefined>,
+): Promise<number | undefined> {
+  try {
+    const [{ findTranscript }, fs, os, path] = await Promise.all([
+      import("./claude-transcript.js"),
+      import("node:fs/promises"),
+      import("node:os"),
+      import("node:path"),
+    ]);
+    const candidates =
+      configDirs ?? [undefined, path.join(os.homedir(), ".telecode", "claude-config")];
+    let transcriptPath: string | null = null;
+    for (const configDir of candidates) {
+      transcriptPath = await findTranscript(providerSessionId, 0, configDir);
+      if (transcriptPath) {
+        break;
+      }
+    }
+    if (!transcriptPath) {
+      return undefined;
+    }
+    const handle = await fs.open(transcriptPath, "r");
+    try {
+      const { size } = await handle.stat();
+      const readStart = Math.max(0, size - 128 * 1024);
+      const length = size - readStart;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, readStart);
+      const lines = buffer.toString("utf8").split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) {
+          continue;
+        }
+        let entry: unknown;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          // First tail line is usually a partial record; skip it.
+          continue;
+        }
+        const record = entry as {
+          type?: string;
+          message?: { usage?: Record<string, unknown> };
+        };
+        if (record.type !== "assistant" || !record.message?.usage) {
+          continue;
+        }
+        const usage = record.message.usage;
+        const prompt = (asNumber(usage.input_tokens) ?? 0) +
+          (asNumber(usage.cache_read_input_tokens) ?? 0) +
+          (asNumber(usage.cache_creation_input_tokens) ?? 0);
+        if (prompt <= 0) {
+          continue;
+        }
+        return prompt + (asNumber(usage.output_tokens) ?? 0);
+      }
+      return undefined;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIterable<AgentProviderEvent> {
   const queryFn = options.queryFn ?? (await loadSdkQuery());
   const { sessionId, jobId } = options;
@@ -243,6 +333,23 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
             continue;
           }
 
+          if (
+            message.type === "system" &&
+            isPriorityClaudeSystemNoticeSubtype(message.subtype)
+          ) {
+            const noticeText = extractSystemNoticeText(message as unknown as Record<string, unknown>);
+            if (noticeText) {
+              yield {
+                type: "status_message",
+                sessionId,
+                jobId,
+                text: noticeText,
+                priority: true,
+              };
+            }
+            continue;
+          }
+
           if (message.type === "assistant") {
             // The prompt of the most recent API call is the live context size.
             const assistantUsage = message.message?.usage;
@@ -314,6 +421,25 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
             // These three are the turn's totals across every API call it made;
             // contextTokens is the live prompt size. Reporting the totals as
             // "context" produced millions-of-tokens readings on long turns.
+            // When the live tracker is empty (Z.AI zeroes assistant usage),
+            // recover the real last-call size from the session transcript
+            // instead of ever falling back to the totals.
+            let contextTokens = lastContextTokens;
+            if (
+              contextTokens === undefined &&
+              activeProviderSessionId &&
+              inputTokens + cachedInputTokens > 0
+            ) {
+              const recovered = await recoverSdkContextFromTranscript(activeProviderSessionId);
+              if (recovered !== undefined) {
+                contextTokens = recovered;
+                lastContextTokens = recovered;
+                bridgeLog(
+                  "usage",
+                  `sdk live context recovered from transcript session=${activeProviderSessionId} context=${recovered}`,
+                );
+              }
+            }
             yield {
               type: "usage_updated",
               sessionId,
@@ -321,7 +447,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
               inputTokens,
               cachedInputTokens,
               outputTokens,
-              contextTokens: lastContextTokens,
+              contextTokens,
             };
 
             if (message.subtype === "success") {

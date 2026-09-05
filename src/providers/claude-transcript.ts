@@ -52,6 +52,8 @@ const SYSTEM_NOTICE_FALLBACKS = new Map<string, string>([
   ["refusal_banner", "Claude displayed a refusal notice."],
 ]);
 
+const PRIORITY_SYSTEM_NOTICE_SUBTYPES = new Set(SYSTEM_NOTICE_FALLBACKS.keys());
+
 export async function findTranscript(
   sessionId: string,
   timeoutMs: number,
@@ -452,6 +454,7 @@ export function projectClaudeTranscriptEntry(
             type: "status_message",
             sessionId: options.sessionId,
             text: noticeText,
+            priority: isPriorityClaudeSystemNoticeSubtype(subtype),
           }
         : {
             type: "session_status_changed",
@@ -730,7 +733,33 @@ function extractAssistantText(message: JsonObject | undefined): string {
   return parts.join("");
 }
 
-function extractSystemNoticeText(entry: JsonObject): string {
+export function isPriorityClaudeSystemNoticeSubtype(subtype: string | undefined): boolean {
+  return Boolean(subtype && PRIORITY_SYSTEM_NOTICE_SUBTYPES.has(subtype));
+}
+
+export function extractSystemNoticeText(entry: JsonObject): string {
+  const subtype = asString(entry.subtype);
+  const originalModel = asString(entry.original_model) || asString(entry.originalModel);
+  const fallbackModel = asString(entry.fallback_model) || asString(entry.fallbackModel);
+  const refusalCategory = asString(entry.api_refusal_category) || asString(entry.apiRefusalCategory);
+  const scope = asString(entry.scope);
+
+  if (subtype === "model_refusal_fallback" && originalModel && fallbackModel) {
+    const originalLabel = formatClaudeModelNoticeLabel(originalModel);
+    const fallbackLabel = formatClaudeModelNoticeLabel(fallbackModel);
+    const reason = refusalCategory ? ` Reason: ${refusalCategory} safeguards.` : "";
+    const persistence = scope === "local"
+      ? ` Only this response uses ${fallbackLabel}; the main session model is unchanged.`
+      : ` This session will continue on ${fallbackLabel}.`;
+    return `Claude model fallback: ${originalLabel} switched to ${fallbackLabel}.${reason}${persistence}`;
+  }
+
+  if (subtype === "model_refusal_no_fallback" && originalModel) {
+    const originalLabel = formatClaudeModelNoticeLabel(originalModel);
+    const reason = refusalCategory ? ` Reason: ${refusalCategory} safeguards.` : "";
+    return `Claude model refusal: ${originalLabel} refused this request.${reason} No fallback model was used.`;
+  }
+
   const direct = asString(entry.text) || asString(entry.message) || asString(entry.notice) || asString(entry.content);
   if (direct) {
     return truncateOneLine(direct, 1000);
@@ -757,6 +786,17 @@ function extractSystemNoticeText(entry: JsonObject): string {
   }
 
   return SYSTEM_NOTICE_FALLBACKS.get(asString(entry.subtype)) ?? "";
+}
+
+function formatClaudeModelNoticeLabel(model: string): string {
+  const normalized = model.trim().replace(/\[1m\]$/iu, "");
+  const match = normalized.match(/^claude-(fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d+))?(?:-\d{8})?$/iu);
+  if (!match) {
+    return model;
+  }
+  const family = match[1]![0]!.toUpperCase() + match[1]!.slice(1).toLowerCase();
+  const version = match[3] ? `${match[2]}.${match[3]}` : match[2];
+  return `${family} ${version}`;
 }
 
 async function transcriptPromptRecoveryCandidates(options: {

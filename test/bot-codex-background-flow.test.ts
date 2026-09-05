@@ -173,6 +173,60 @@ describe("Codex background completion flow", () => {
     // Still queued, so it runs as the follow-up turn instead of being lost.
     await waitFor(() => harness.prompts.includes("also check the config"));
   });
+
+  it("accepts max for Sol when the shared cache currently contains only vendor models", async () => {
+    const config = createConfig(tempDir);
+    const registry = new SessionRegistry(config);
+    const info: CodexSessionInfo = {
+      threadId: null,
+      workspace: tempDir,
+      model: "gpt-5.6-sol",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "danger-full-access, never approve",
+      sandboxMode: "danger-full-access",
+      approvalPolicy: "never",
+      unsafeLaunch: true,
+    };
+    const setReasoningEffort = vi.fn((effort: string) => {
+      info.reasoningEffort = effort;
+    });
+    const session = {
+      getInfo: () => info,
+      isProcessing: () => false,
+      listModels: () => [
+        { slug: "qwen3.8-max", displayName: "Qwen 3.8 Max", supportedReasoningEfforts: ["max"] },
+      ],
+      setReasoningEffort,
+    };
+    vi.spyOn(registry, "getOrCreate").mockResolvedValue(session as never);
+
+    const bot = createBot(config, registry);
+    const sent: string[] = [];
+    bot.api.config.use(async (_prev, method, payload: { text?: string }) => {
+      if (method === "sendMessage") {
+        sent.push(payload.text ?? "");
+        return { ok: true, result: textMessage(1, payload.text ?? "") };
+      }
+      throw new Error(`Unhandled Telegram API method in test: ${method}`);
+    });
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "TeleCode",
+      username: "TeleCodeBot",
+      can_join_groups: true,
+      can_read_all_group_messages: false,
+      supports_inline_queries: false,
+      can_connect_to_business: false,
+      has_main_web_app: false,
+    };
+
+    await bot.handleUpdate(textUpdate(1, "/effort max"));
+
+    expect(setReasoningEffort).toHaveBeenCalledWith("max");
+    expect(sent).toContain("Reasoning effort set to max. It applies from the next turn in this context.");
+  });
 });
 
 interface SteerHarness {

@@ -514,10 +514,13 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
             inputTokens: event.inputTokens ?? 0,
             cachedInputTokens: event.cachedInputTokens ?? 0,
             outputTokens: event.outputTokens ?? 0,
-            // Prefer the engine's live prompt size; the input/cached figures
-            // are turn totals and overstate context on multi-call turns.
+            // The engine's live prompt size when it has one. The input/cached
+            // figures are turn totals (they re-count the cached prefix every
+            // API call), so when no live figure exists keep the last known
+            // context rather than overstating it with the turn totals.
             contextTokens: event.contextTokens
-              ?? (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
+              ?? runtime.lastUsage?.contextTokens
+              ?? 0,
           };
         } else if (event.type === "model_updated") {
           runtime.model = event.model;

@@ -903,6 +903,143 @@ describe("AppServerSessionService", () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it("starts a clean handoff thread when switching between model vendors", async () => {
+    vi.stubEnv("DASHSCOPE_API_KEY", "sk-sp-test");
+    try {
+      const clients: FakeAppServerClient[] = [];
+      const factory = () => {
+        const clientIndex = clients.length;
+        const client = new FakeAppServerClient((method, params, activeClient) => {
+          if (method === "thread/start") {
+            return {
+              thread: {
+                id: clientIndex === 0 ? "thread-qwen" : "thread-openai",
+                cwd: "/workspace/project",
+              },
+            };
+          }
+          if (method === "turn/start" && clientIndex === 1) {
+            setTimeout(() => {
+              activeClient.emit({
+                method: "turn/completed",
+                params: { turn: { id: "turn-openai", status: "completed" } },
+              });
+            }, 0);
+            return { turn: { id: "turn-openai" } };
+          }
+          throw new Error(`unexpected request ${method}`);
+        });
+        clients.push(client);
+        return client;
+      };
+
+      const service = await AppServerSessionService.create(createConfig(), {
+        appServerClientFactory: factory,
+        model: "qwen3.8-max",
+      });
+
+      service.setModel("gpt-5.6-sol");
+      expect(service.hasActiveThread()).toBe(false);
+      await service.newThread();
+      await service.prompt("continue on OpenAI", {
+        onTextDelta: vi.fn(),
+        onToolStart: vi.fn(),
+        onToolUpdate: vi.fn(),
+        onToolEnd: vi.fn(),
+        onAgentEnd: vi.fn(),
+      });
+
+      expect(clients).toHaveLength(2);
+      expect(clients[0]?.closed).toHaveBeenCalledOnce();
+      expect(service.getInfo().threadId).toBe("thread-openai");
+      const request = clients[1]?.requests.find((candidate) => candidate.method === "turn/start");
+      const text = (request?.params as { input?: Array<{ text?: string }> }).input?.[0]?.text ?? "";
+      expect(text).toContain("continue on OpenAI");
+      expect(text).toContain("<telecode_cross_provider_handoff>");
+      expect(text).toContain("thread-qwen");
+      expect(text).toContain("original source thread is preserved");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("keeps the current thread when changing models inside one vendor", async () => {
+    vi.stubEnv("DASHSCOPE_API_KEY", "sk-sp-test");
+    try {
+      const client = new FakeAppServerClient((method) => {
+        if (method === "thread/start") {
+          return { thread: { id: "thread-qwen", cwd: "/workspace/project" } };
+        }
+        throw new Error(`unexpected request ${method}`);
+      });
+      const service = await AppServerSessionService.create(createConfig(), {
+        appServerClientFactory: () => client,
+        model: "qwen3.8-max",
+      });
+
+      service.setModel("glm-5.2");
+
+      expect(service.hasActiveThread()).toBe(true);
+      expect(service.getInfo()).toMatchObject({ threadId: "thread-qwen", model: "glm-5.2" });
+      expect(client.closed).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("recovers an already-poisoned thread once and retries the same prompt", async () => {
+    let threadStarts = 0;
+    let turnStarts = 0;
+    const client = new FakeAppServerClient((method, params, activeClient) => {
+      if (method === "thread/start") {
+        threadStarts += 1;
+        return {
+          thread: {
+            id: threadStarts === 1 ? "thread-poisoned" : "thread-clean",
+            cwd: "/workspace/project",
+          },
+          model: "gpt-5.6-sol",
+        };
+      }
+      if (method === "turn/start") {
+        turnStarts += 1;
+        if (turnStarts === 1) {
+          throw new Error(
+            "invalid_id_prefix: Invalid 'input[4].id': 'msg_foreign'. Expected an ID that begins with 'rs'.",
+          );
+        }
+        setTimeout(() => {
+          activeClient.emit({
+            method: "turn/completed",
+            params: { turn: { id: "turn-clean", status: "completed" } },
+          });
+        }, 0);
+        return { turn: { id: "turn-clean" } };
+      }
+      throw new Error(`unexpected request ${method}`);
+    });
+
+    const service = await AppServerSessionService.create(createConfig({ codexModel: "gpt-5.6-sol" }), {
+      appServerClientFactory: () => client,
+    });
+    await service.prompt("retry me", {
+      onTextDelta: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolUpdate: vi.fn(),
+      onToolEnd: vi.fn(),
+      onAgentEnd: vi.fn(),
+    });
+
+    expect(threadStarts).toBe(2);
+    expect(turnStarts).toBe(2);
+    expect(service.getInfo().threadId).toBe("thread-clean");
+    const retryRequest = client.requests.filter((request) => request.method === "turn/start")[1];
+    const text = (retryRequest?.params as { input?: Array<{ text?: string }> }).input?.[0]?.text ?? "";
+    expect(text).toContain("retry me");
+    expect(text).toContain("thread-poisoned");
+    expect(text).toContain("<telecode_cross_provider_handoff>");
+  });
 });
 
 function createConfig(overrides: Partial<TeleCodeConfig> = {}): TeleCodeConfig {

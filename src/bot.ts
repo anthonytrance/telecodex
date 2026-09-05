@@ -9379,6 +9379,10 @@ function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName
     codexsol: "gpt-5.6-sol",
     codex56sol: "gpt-5.6-sol",
     sol: "gpt-5.6-sol",
+    codexastra: "gpt-6-astra",
+    codex6astra: "gpt-6-astra",
+    "6astra": "gpt-6-astra",
+    astra: "gpt-6-astra",
   };
   const aliased = aliases[normalized];
   if (aliased && models.some((model) => model.slug === aliased)) {

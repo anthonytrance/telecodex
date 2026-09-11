@@ -121,6 +121,12 @@ export interface SdkUserMessageLike {
   timestamp?: string;
 }
 
+/**
+ * Ceiling on injected-turn results we skip past in one attempt, so a CLI that only
+ * ever emits silent results still terminates into the normal retry path.
+ */
+const MAX_IGNORED_INJECTED_RESULTS = 8;
+
 export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLike> {
   private readonly queue: SdkUserMessageLike[] = [];
   private readonly waiters: Array<(result: IteratorResult<SdkUserMessageLike>) => void> = [];
@@ -158,6 +164,16 @@ export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLik
     for (const waiter of this.waiters.splice(0)) {
       waiter({ value: undefined, done: true });
     }
+  }
+
+  /**
+   * Re-arm the stream for the next attempt of the same turn. Each SDK query needs
+   * its input iterable to end before it can shut down, but the turn as a whole is
+   * still live and the user can still steer it. Without this a retry left the
+   * controller permanently closed and every later steer threw.
+   */
+  reopen(): void {
+    this.closed = false;
   }
 
   [Symbol.asyncIterator](): AsyncIterator<SdkUserMessageLike> {
@@ -284,7 +300,10 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
       // one primary AsyncIterable so the SDK leaves stdin open for the continuation.
       // The initial message is yielded before the controller is read, so it cannot be
       // overtaken by a live steer or a pending provider notification.
-      const sdkPrompt = attempt === 0 && inputController
+      // Every attempt gets the live-input iterable, not just the first: a retry is
+      // still the same user-visible turn and must stay steerable.
+      inputController?.reopen();
+      const sdkPrompt = inputController
         ? initialPromptAndLiveInput(retryPrompt, inputController)
         : retryPrompt;
       const query = queryFn({ prompt: sdkPrompt, options: sdkOptions });
@@ -294,6 +313,10 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
       let finalAssistantTextSteerCount = inputController?.deliveredCount ?? 0;
       let handledSteerCount = 0;
       let retryEmptySuccess = false;
+      // Real (non-synthetic) assistant output seen in THIS attempt. Until it flips,
+      // any result the CLI emits belongs to a turn it injected ahead of ours.
+      let sawAssistantActivity = false;
+      let ignoredInjectedResults = 0;
 
       try {
         for await (const item of sdkMessagesWithQuietStatus(
@@ -370,6 +393,9 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
               finalAssistantTextSteerCount = deliveredSteerCount;
             }
             const model = message.message?.model;
+            if (model && model !== "<synthetic>") {
+              sawAssistantActivity = true;
+            }
             if (model && model !== "<synthetic>" && model !== lastModel) {
               lastModel = model;
               yield { type: "model_updated", sessionId, jobId, model };
@@ -477,6 +503,19 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
                   `sdk received empty interrupted result; awaiting steered continuation session=${activeProviderSessionId ?? sessionId}`,
                 );
                 continue;
+              } else if (!sawAssistantActivity && ignoredInjectedResults < MAX_IGNORED_INJECTED_RESULTS) {
+                // Claude Code drains its own pending queue before our prompt runs, and
+                // each injected item (background <task-notification>s, the resume
+                // rescue prompt) completes as its own successful-but-silent turn. Those
+                // results are not ours: tearing the query down here killed the user's
+                // prompt mid-flight, which is what left orphaned tool calls and forced
+                // a from-scratch retry. Keep reading; the real result still follows.
+                ignoredInjectedResults += 1;
+                bridgeLog(
+                  "sdk",
+                  `ignored empty success before any assistant output session=${activeProviderSessionId ?? sessionId}`,
+                );
+                continue;
               } else if (attempt === 0) {
                 retryEmptySuccess = true;
                 sawTerminalResult = true;
@@ -503,9 +542,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
           // of the provider event contract; ignored deliberately.
         }
       } finally {
-        if (attempt === 0) {
-          inputController?.close();
-        }
+        inputController?.close();
         query.close?.();
       }
 
@@ -519,21 +556,26 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         return;
       }
       if (!sawTerminalResult) {
-        // The transport ended after the empty result that interrupted a live steer,
-        // before it produced the continuation. Retry through resume instead of
-        // silently accepting the interrupted response as a completed turn.
+        // The stream ended on a result we deliberately did not accept: either the empty
+        // result that interrupted a live steer, or an injected turn's silent result.
+        // Retry through resume instead of passing that off as a completed turn.
+        const cause = handledSteerCount > 0
+          ? "steered continuation"
+          : "assistant text";
         if (attempt === 0) {
           retryEmptySuccess = true;
           bridgeLog(
             "retry",
-            `sdk stream ended before steered continuation; retrying session=${activeProviderSessionId ?? sessionId}`,
+            `sdk stream ended before ${cause}; retrying session=${activeProviderSessionId ?? sessionId}`,
           );
         } else {
           yield {
             type: "error",
             sessionId,
             jobId,
-            message: "Claude SDK ended before producing a response to the live steer.",
+            message: handledSteerCount > 0
+              ? "Claude SDK ended before producing a response to the live steer."
+              : "Claude SDK returned a successful result without assistant text twice.",
           };
           return;
         }

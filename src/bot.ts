@@ -1541,7 +1541,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     contextKey: TelegramContextKey,
     chatId: TelegramChatId,
     text: string,
-    options: { kind?: ClaudeQueuedPromptKind; front?: boolean } = {},
+    options: { kind?: ClaudeQueuedPromptKind; front?: boolean; liveSteerError?: string } = {},
   ): Promise<void> => {
     const { entry, depth } = enqueueClaudePromptFromSource({
       ctx,
@@ -1556,7 +1556,18 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         ? `Claude is still working. I queued this Claude message as item #${depth}.`
         : "Claude is still working. I queued this Claude message and will run it next.";
     pendingQueuedPrompts.set(contextKey, { provider: "claude", claudeEntryId: entry.id, text });
-    const fullText = `${replyText}\n${QUEUED_PROMPT_ACTION_HINT}`;
+    // A steer that silently degrades into an ordinary queued follow-up is the worst
+    // outcome: it looks like the instruction landed when it never interrupted anything.
+    // Say so, and drop the s/d hint, because s would just fail the same way.
+    const fullText = options.liveSteerError
+      ? [
+        `Live steer FAILED, it did not reach the running turn: ${options.liveSteerError}`,
+        depth > 1
+          ? `I queued the text as Claude follow-up #${depth} instead, so it runs once the current turn finishes.`
+          : "I queued the text instead, so it runs once the current turn finishes.",
+        "Send d to drop it, or /stop to abort the running turn.",
+      ].join("\n")
+      : `${replyText}\n${QUEUED_PROMPT_ACTION_HINT}`;
     await safeReply(ctx, escapeHTML(fullText), { fallbackText: fullText });
   };
 
@@ -1621,6 +1632,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     prompt: string,
   ): Promise<void> => {
     const messageThreadId = source.messageThreadId ?? parseContextKey(contextKey).messageThreadId;
+    let liveSteerError: string | undefined;
     if (isProviderBusy(contextKey, "claude") || getBusyState(contextKey).processing) {
       const descriptor = claudeSessions.get(contextKey);
       if (descriptor && claudeAdapter?.streamInput) {
@@ -1633,11 +1645,15 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           return;
         } catch (error) {
           bridgeLog("steer", `live Claude steer failed lane=${contextKey}: ${String(error)}`);
+          liveSteerError = friendlyErrorText(error);
         }
       }
 
       if (source.ctx) {
-        await queueClaudePromptReply(source.ctx, contextKey, source.chatId, prompt, { kind: "steer" });
+        await queueClaudePromptReply(source.ctx, contextKey, source.chatId, prompt, {
+          kind: "steer",
+          ...(liveSteerError ? { liveSteerError } : {}),
+        });
       } else {
         enqueueClaudePromptFromSource(source, contextKey, prompt, { kind: "steer" });
       }

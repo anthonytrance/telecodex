@@ -442,12 +442,120 @@ describe("claude sdk engine", () => {
     }
     expect(firstAttemptPrompts[0]).toBe(baseOptions.promptText);
     expect(calls[1]?.options.resume).toBe("real-resumed-session");
-    expect(calls[1]?.prompt).toEqual(expect.stringContaining("previous turn ended successfully"));
+    // The retry is still the same user-visible turn, so it keeps the live-input
+    // iterable rather than degrading to a single-shot string prompt.
+    expect(typeof calls[1]?.prompt).not.toBe("string");
+    const retryPrompts: string[] = [];
+    if (typeof calls[1]?.prompt !== "string") {
+      for await (const message of calls[1]!.prompt) {
+        retryPrompts.push(message.message.content[0]?.text ?? "");
+      }
+    }
+    expect(retryPrompts[0]).toEqual(expect.stringContaining("previous turn ended successfully"));
     expect(events.some((event) => event.type === "status_message")).toBe(false);
     expect(events).toContainEqual(expect.objectContaining({
       type: "assistant_message_complete",
       text: "Recovered answer",
     }));
+  });
+
+  it("reads past an injected turn's silent result instead of tearing the query down", async () => {
+    // Claude Code drains its own pending queue (background <task-notification>s,
+    // the resume rescue prompt) before our prompt runs, and each of those
+    // completes as its own successful-but-empty result. Killing the query there
+    // cut the user's real turn off mid-flight.
+    const calls: Array<{ prompt: unknown; options: Record<string, unknown> }> = [];
+    const queryFn = (input: { prompt: unknown; options: Record<string, unknown> }) => {
+      calls.push(input);
+      return (async function* () {
+        yield { type: "system", subtype: "init", session_id: "real-session-id" } satisfies SdkMessageLike;
+        yield { type: "result", subtype: "success", result: "", usage: {} } satisfies SdkMessageLike;
+        yield { type: "result", subtype: "success", result: "", usage: {} } satisfies SdkMessageLike;
+        yield {
+          type: "assistant",
+          message: { model: "claude-sonnet-5", content: [{ type: "text", text: "Real answer" }] },
+        } satisfies SdkMessageLike;
+        yield { type: "result", subtype: "success", result: "Real answer", usage: {} } satisfies SdkMessageLike;
+      })();
+    };
+
+    const events = await collect(runClaudeSdkTurn({
+      ...baseOptions,
+      inputController: new ClaudeSdkInputController(),
+      queryFn,
+    }));
+
+    // One attempt only: no bogus retry, so nothing restarts the turn from scratch.
+    expect(calls).toHaveLength(1);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "assistant_message_complete",
+      text: "Real answer",
+    }));
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
+  it("gives up on injected results after the cap instead of looping forever", async () => {
+    const calls: unknown[] = [];
+    const queryFn = (input: unknown) => {
+      calls.push(input);
+      return (async function* () {
+        yield { type: "system", subtype: "init", session_id: "s" } satisfies SdkMessageLike;
+        for (let index = 0; index < 50; index += 1) {
+          yield { type: "result", subtype: "success", result: "", usage: {} } satisfies SdkMessageLike;
+        }
+      })();
+    };
+
+    const events = await collect(runClaudeSdkTurn({ ...baseOptions, queryFn }));
+
+    expect(calls).toHaveLength(2);
+    expect(events).toContainEqual(expect.objectContaining({ type: "error" }));
+  });
+
+  it("keeps accepting live steers on the retry attempt", async () => {
+    // The input controller used to be closed in attempt 0's finally, so after a
+    // retry every steer threw and silently degraded into a queued follow-up.
+    const controller = new ClaudeSdkInputController();
+    const calls: Array<{ prompt: string | AsyncIterable<SdkUserMessageLike>; options: Record<string, unknown> }> = [];
+    const queryFn = (input: {
+      prompt: string | AsyncIterable<SdkUserMessageLike>;
+      options: Record<string, unknown>;
+    }) => {
+      calls.push(input);
+      const callNumber = calls.length;
+      return (async function* () {
+        yield { type: "system", subtype: "init", session_id: "s" } satisfies SdkMessageLike;
+        if (callNumber === 1) {
+          yield { type: "result", subtype: "success", result: "", usage: {} } satisfies SdkMessageLike;
+          return;
+        }
+        await waitUntil(() => attemptTwoStarted);
+        yield {
+          type: "assistant",
+          message: { model: "claude-sonnet-5", content: [{ type: "text", text: "steered answer" }] },
+        } satisfies SdkMessageLike;
+        yield { type: "result", subtype: "success", result: "steered answer", usage: {} } satisfies SdkMessageLike;
+      })();
+    };
+
+    let attemptTwoStarted = false;
+    const events = collect(runClaudeSdkTurn({ ...baseOptions, inputController: controller, queryFn }));
+
+    await waitUntil(() => calls.length === 2);
+    // The steer would throw here if the retry had inherited a closed controller.
+    controller.push("actually do this instead", "now");
+    attemptTwoStarted = true;
+
+    await events;
+    const retryPrompt = calls[1]?.prompt;
+    expect(typeof retryPrompt).not.toBe("string");
+    const retryTexts: string[] = [];
+    if (typeof retryPrompt !== "string" && retryPrompt) {
+      for await (const message of retryPrompt) {
+        retryTexts.push(message.message.content[0]?.text ?? "");
+      }
+    }
+    expect(retryTexts).toContain("actually do this instead");
   });
 
   it("reports an error instead of an empty completion when both attempts are empty", async () => {

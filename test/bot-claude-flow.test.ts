@@ -1478,6 +1478,37 @@ describe("Claude bot flow", () => {
     });
   });
 
+  it("buffers parked output arriving mid-turn where /replay can actually find it", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    mockClaude.blockNextPrompt();
+    await bot.handleUpdate(textUpdate(2, "busy turn"));
+    await waitFor(() => mockClaude.prompts.includes("busy turn"));
+
+    // The lane is busy, so this goes to the replay buffer rather than the chat.
+    // It has to be filed under the AGENT SESSION id: keying it on the provider
+    // descriptor id put it in a bucket /replay never drains, which lost exactly
+    // the late answers parking exists to rescue.
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_message_complete",
+      sessionId: "claude-provider-1",
+      jobId: "parked-job",
+      text: "PARKED_WHILE_BUSY",
+    });
+
+    mockClaude.releaseBlockedPrompt();
+    await waitFor(() => mockClaude.prompts.includes("busy turn") && sent.length > 0);
+    // Buffered, not sent: it must surface through /replay, not interrupt the turn.
+    expect(sent.some((entry) => entry.text?.includes("PARKED_WHILE_BUSY"))).toBe(false);
+
+    await bot.handleUpdate(textUpdate(3, "/replay all"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("PARKED_WHILE_BUSY")));
+
+    const replay = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Buffered Claude output"));
+    expect(replay.join("\n")).toContain("PARKED_WHILE_BUSY");
+  });
+
   it("drops parked output for a session the lane does not know", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 

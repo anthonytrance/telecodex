@@ -13,6 +13,7 @@ import {
 } from "../model-vendors.js";
 import {
   ClaudeSdkInputController,
+  type ParkedQuery,
   runClaudeSdkCompact,
   runClaudeSdkTurn,
 } from "./claude-sdk-engine.js";
@@ -88,11 +89,12 @@ interface RuntimeSession {
   /** Pushes user steering messages into an active SDK streaming-input turn. */
   sdkInputController?: ClaudeSdkInputController;
   /**
-   * Input controller of a PARKED sdk query (turn answered, CLI still alive).
-   * Closing it ends the parked drain promptly; the next turn closes it before
-   * opening a fresh query so two processes never write one session transcript.
+   * A PARKED sdk query: its turn was answered but the CLI is still alive, working
+   * through whatever it queued behind that answer. The next turn adopts it so the
+   * prompt arrives as a steer into the running process instead of killing it
+   * mid-flight; only when adoption fails is it closed and a fresh query opened.
    */
-  parkedInputController?: ClaudeSdkInputController;
+  parkedQuery?: ParkedQuery;
   /**
    * Set on a freshly forked session: the next turn resumes THIS session id with
    * fork semantics (SDK forkSession / PTY --fork-session), then Claude mints a new
@@ -385,8 +387,8 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime.abortRequested = true;
     runtime.sdkAbortController?.abort();
     // An aborted session should not leave a parked query running in the background.
-    runtime.parkedInputController?.close();
-    runtime.parkedInputController = undefined;
+    runtime.parkedQuery?.close();
+    runtime.parkedQuery = undefined;
     runtime.pty?.pressEscape();
   }
 
@@ -495,12 +497,24 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
 
     const abortController = new AbortController();
-    // A parked query from the previous turn may still be alive. Close it first:
-    // its drain exits cleanly and the fresh query below becomes the session's
-    // only writer, so two processes can never interleave on one transcript.
-    runtime.parkedInputController?.close();
-    runtime.parkedInputController = undefined;
-    const inputController = new ClaudeSdkInputController();
+    // A parked query from the previous turn may still be alive and mid-way through
+    // the work the CLI queued behind that turn's answer. Adopt it rather than kill
+    // it: takeOver() waits for the drain to let go, then this prompt is steered
+    // into the SAME process. Killing it here is what truncated the CLI's turn and
+    // made it inject "Continue from where you left off." on the next resume.
+    // takeOver() returning false means the park is already gone, so the fresh query
+    // below is the session's only writer either way.
+    const parked = runtime.parkedQuery;
+    let adoptedQuery: ParkedQuery | undefined;
+    if (parked) {
+      if (await parked.takeOver()) {
+        adoptedQuery = parked;
+      } else {
+        parked.close();
+      }
+      runtime.parkedQuery = undefined;
+    }
+    const inputController = adoptedQuery?.inputController ?? new ClaudeSdkInputController();
     runtime.sdkAbortController = abortController;
     runtime.sdkInputController = inputController;
     let partialText = "";
@@ -523,13 +537,14 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         quietStatusIntervalMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
         autoCompactWindow: this.config.claudeAutoCompactWindow,
         parkIdleMs: this.config.claudeParkIdleMs,
+        adoptedQuery,
         onParkedEvent: (event) => this.handleParkedEvent(runtime, event),
-        onParkStateChanged: (parked) => {
-          if (parked) {
-            runtime.parkedInputController = inputController;
+        onParkStateChanged: (isParked, query) => {
+          if (isParked) {
+            runtime.parkedQuery = query;
             parkOwnsController = true;
-          } else if (runtime.parkedInputController === inputController) {
-            runtime.parkedInputController = undefined;
+          } else if (runtime.parkedQuery === query) {
+            runtime.parkedQuery = undefined;
           }
         },
         onProviderSessionId: (providerSessionId) => {
@@ -744,7 +759,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     if (sessionId) {
       const runtime = this.sessions.get(sessionId);
       runtime?.sdkAbortController?.abort();
-      runtime?.parkedInputController?.close();
+      runtime?.parkedQuery?.close();
       if (runtime?.pty) {
         await runtime.pty.dispose(true);
       }
@@ -755,7 +770,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     for (const runtime of this.sessions.values()) {
       runtime.sdkAbortController?.abort();
-      runtime.parkedInputController?.close();
+      runtime.parkedQuery?.close();
       await runtime.pty?.dispose(true);
       this.removeRegisteredProcessSession(runtime.descriptor.id);
     }

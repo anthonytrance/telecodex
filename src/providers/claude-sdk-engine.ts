@@ -59,7 +59,16 @@ export interface ClaudeSdkTurnOptions {
   /** Receives events the CLI produced after the turn's answer (parked drain). */
   onParkedEvent?: (event: AgentProviderEvent) => void;
   /** Signals when the parked drain takes and releases the query + input controller. */
-  onParkStateChanged?: (parked: boolean) => void;
+  onParkStateChanged?: (parked: boolean, query: ParkedQuery) => void;
+  /**
+   * A still-live query parked by this session's previous turn, already handed over
+   * by the caller via takeOver(). When set, this turn steers the prompt into that
+   * query instead of opening a new one, so the CLI is never interrupted mid-flight
+   * on the work it queued after the last answer — the truncated turn that made
+   * Claude Code inject "Continue from where you left off." on the next resume.
+   * Its inputController must also be passed as options.inputController.
+   */
+  adoptedQuery?: ParkedQuery;
   /** Injectable for tests; defaults to the real SDK query(). */
   queryFn?: (input: {
     prompt: string | AsyncIterable<SdkUserMessageLike>;
@@ -169,6 +178,11 @@ export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLik
     } else {
       this.queue.push(message);
     }
+  }
+
+  /** True once close() ran and before any reopen(); pushes would throw. */
+  get isClosed(): boolean {
+    return this.closed;
   }
 
   close(): void {
@@ -291,21 +305,173 @@ export async function recoverSdkContextFromTranscript(
 /** Absolute ceiling on one parked query, whatever the traffic. */
 export const PARK_HARD_CAP_MS = 30 * 60_000;
 
+/** How long a new turn waits for the parked drain to let go before giving up on it. */
+export const PARK_HANDOVER_TIMEOUT_MS = 5_000;
+
 /**
- * Wait for the next parked message, giving up after timeoutMs. Resolves undefined
- * on timeout — unlike waitForSdkMessage, which keeps waiting and only reports quiet
- * periods, a parked drain's whole job is to end when the CLI goes silent.
+ * A live SDK query that outlives the turn that opened it. Two readers take turns
+ * on it: the parked drain between turns, and runClaudeSdkTurn again when the next
+ * prompt adopts the park instead of opening a fresh query.
+ *
+ * Handing the stream between readers must not drop a message, so the in-flight
+ * iterator.next() promise is cached here. A reader that loses its race (idle
+ * timeout, handover) leaves the pending promise behind for whoever reads next,
+ * instead of abandoning it along with the message it is about to deliver.
+ */
+export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
+  private readonly iterator: AsyncIterator<SdkMessageLike>;
+  private pending?: Promise<IteratorResult<SdkMessageLike>>;
+  private closed = false;
+  private draining = false;
+  private handoverWanted = false;
+  private signalHandover?: () => void;
+  private drainFinished?: Promise<void>;
+  private resolveDrainFinished?: () => void;
+
+  constructor(
+    private readonly query: AsyncIterable<SdkMessageLike> & { close?: () => void },
+    readonly inputController: ClaudeSdkInputController | undefined,
+    public providerSessionId: string | undefined,
+  ) {
+    this.iterator = query[Symbol.asyncIterator]();
+  }
+
+  next(): Promise<IteratorResult<SdkMessageLike>> {
+    if (!this.pending) {
+      this.pending = this.iterator.next().then(
+        (result) => {
+          this.pending = undefined;
+          return result;
+        },
+        (error) => {
+          this.pending = undefined;
+          throw error;
+        },
+      );
+    }
+    return this.pending;
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SdkMessageLike> {
+    return { next: () => this.next() };
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** True once a turn asked to adopt this query; the drain must then let go. */
+  get handoverRequested(): boolean {
+    return this.handoverWanted;
+  }
+
+  /** Called by the drain as it takes the stream; re-arms after a previous handover. */
+  beginDrain(): void {
+    this.draining = true;
+    this.handoverWanted = false;
+    this.signalHandover = undefined;
+    this.drainFinished = new Promise<void>((resolve) => {
+      this.resolveDrainFinished = resolve;
+    });
+  }
+
+  /** Race target for the drain: resolves when a turn wants the stream. */
+  handoverSignal(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (this.handoverWanted) {
+        resolve();
+        return;
+      }
+      this.signalHandover = resolve;
+    });
+  }
+
+  /** Called by the drain as it stops reading, whatever the reason. */
+  endDrain(): void {
+    this.draining = false;
+    this.resolveDrainFinished?.();
+  }
+
+  /**
+   * Hand the stream to the next turn. Resolves true when the caller now owns it
+   * and may push its prompt into inputController; false when the park is already
+   * gone (CLI exited, hard cap hit, drain closed it) and the caller must open a
+   * fresh query. Always waits for the drain to stop reading first, so a turn
+   * never races the drain for a message, and never opens a second CLI process
+   * against a transcript the old one is still writing.
+   */
+  async takeOver(timeoutMs = PARK_HANDOVER_TIMEOUT_MS): Promise<boolean> {
+    if (this.closed) {
+      return false;
+    }
+    if (this.draining) {
+      this.handoverWanted = true;
+      this.signalHandover?.();
+      // Bounded: this sits on the path of the user's next message. A drain that
+      // somehow fails to let go must cost one fresh query, not a stuck chat.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const handedOver = await Promise.race([
+        this.drainFinished?.then(() => true) ?? Promise.resolve(true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (!handedOver) {
+        bridgeLog("park", `parked query did not hand over within ${timeoutMs}ms; opening a fresh one`);
+        this.close();
+        return false;
+      }
+    }
+    if (this.closed || this.inputController?.isClosed !== false) {
+      return false;
+    }
+    return true;
+  }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    try {
+      this.inputController?.close();
+    } catch {
+      // Teardown must never throw.
+    }
+    try {
+      this.query.close?.();
+    } catch {
+      // Teardown must never throw.
+    }
+  }
+}
+
+type ParkedWaitOutcome =
+  | { kind: "message"; result: IteratorResult<SdkMessageLike> }
+  | { kind: "timeout" }
+  | { kind: "handover" };
+
+/**
+ * Wait for the next parked message, giving up after timeoutMs or as soon as a new
+ * turn asks to adopt the query. Unlike waitForSdkMessage, which keeps waiting and
+ * only reports quiet periods, a parked drain's whole job is to let go when the CLI
+ * goes silent or when the next prompt needs the stream.
  */
 async function waitForParkedMessage(
-  nextMessage: Promise<IteratorResult<SdkMessageLike>>,
+  handle: ParkedQuery,
   timeoutMs: number,
-): Promise<IteratorResult<SdkMessageLike> | undefined> {
+): Promise<ParkedWaitOutcome> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
-      nextMessage,
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), timeoutMs);
+    return await Promise.race<ParkedWaitOutcome>([
+      handle.next().then((result) => ({ kind: "message", result }) as const),
+      handle.handoverSignal().then(() => ({ kind: "handover" }) as const),
+      new Promise<ParkedWaitOutcome>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
         timer.unref?.();
       }),
     ]);
@@ -325,19 +491,17 @@ async function waitForParkedMessage(
  * the drain promptly because the SDK query finishes once its input does.
  */
 async function drainParkedSdkQuery(args: {
-  query: AsyncIterable<SdkMessageLike> & { close?: () => void };
-  inputController?: ClaudeSdkInputController;
+  handle: ParkedQuery;
   parkIdleMs: number;
   hardCapMs: number;
   onEvent: (event: AgentProviderEvent) => void;
-  providerSessionId: string | undefined;
   sessionId: string;
   jobId: string;
 }): Promise<void> {
   const startedAt = Date.now();
-  const sessionLabel = args.providerSessionId ?? args.sessionId;
+  const sessionLabel = args.handle.providerSessionId ?? args.sessionId;
+  args.handle.beginDrain();
   bridgeLog("park", `keeping finished sdk query alive session=${sessionLabel} idleMs=${args.parkIdleMs}`);
-  const iterator = args.query[Symbol.asyncIterator]();
   try {
     let bufferedText = "";
     const flushText = (): void => {
@@ -357,13 +521,19 @@ async function drainParkedSdkQuery(args: {
       if (remaining <= 0) {
         break;
       }
-      const outcome = await waitForParkedMessage(iterator.next(), remaining);
-      // Undefined = park went quiet (or hit its cap); done = the query finished
-      // (input closed from outside, CLI exited). Either way the park is over.
-      if (!outcome || outcome.done) {
+      const outcome = await waitForParkedMessage(args.handle, remaining);
+      if (outcome.kind === "handover") {
+        // The next turn is adopting this query. Flush whatever the CLI said since
+        // the last result before letting go, or that text dies with the drain.
+        flushText();
         break;
       }
-      const message = outcome.value;
+      // Timeout = park went quiet (or hit its cap); done = the query finished
+      // (input closed from outside, CLI exited). Either way the park is over.
+      if (outcome.kind === "timeout" || outcome.result.done) {
+        break;
+      }
+      const message = outcome.result.value;
       if (message.type === "assistant") {
         const model = message.message?.model;
         if (!model || model === "<synthetic>") {
@@ -415,23 +585,22 @@ async function drainParkedSdkQuery(args: {
       }
     }
     flushText();
-    bridgeLog("park", `park ended after ${Date.now() - startedAt}ms session=${sessionLabel}`);
   } catch (error) {
     bridgeLog(
       "park",
       `park drain failed (turn unaffected): ${error instanceof Error ? error.message : String(error)} session=${sessionLabel}`,
     );
   } finally {
-    try {
-      args.inputController?.close();
-    } catch {
-      // Drain teardown must never throw.
+    // Close BEFORE releasing the drain: a takeOver() waiting on drainFinished then
+    // observes the closed handle and opens a fresh query instead of pushing a
+    // prompt into a stream nobody is reading.
+    if (args.handle.handoverRequested) {
+      bridgeLog("park", `park handed to next turn after ${Date.now() - startedAt}ms session=${sessionLabel}`);
+    } else {
+      args.handle.close();
+      bridgeLog("park", `park ended after ${Date.now() - startedAt}ms session=${sessionLabel}`);
     }
-    try {
-      args.query.close?.();
-    } catch {
-      // Drain teardown must never throw.
-    }
+    args.handle.endDrain();
   }
 }
 
@@ -452,11 +621,16 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   // Hoisted because the drain must launch on every generator exit (normal return,
   // early consumer return, throw) or the query and its CLI process would leak.
   let parked = false;
-  let activeQuery: AsyncIterable<SdkMessageLike> & { close?: () => void } | undefined;
+  let activeQuery: ParkedQuery | undefined;
+  let adoptedQuery = inputController ? options.adoptedQuery : undefined;
+  // Set when an adopted query died before answering: attempt 1 must then re-send
+  // the user's own prompt to a fresh CLI, not the "you produced no response" nudge,
+  // because from the user's point of view the prompt never ran at all.
+  let replayOriginalPrompt = false;
 
   try {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const retryPrompt = attempt === 0
+      const retryPrompt = attempt === 0 || replayOriginalPrompt
         ? options.promptText
         : "The previous turn ended successfully but produced no written response. Answer the user's most recent request now. Do not repeat completed tool actions; summarize them if any occurred.";
       const sdkOptions = {
@@ -472,12 +646,45 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
       // overtaken by a live steer or a pending provider notification.
       // Every attempt gets the live-input iterable, not just the first: a retry is
       // still the same user-visible turn and must stay steerable.
-      inputController?.reopen();
-      const sdkPrompt = inputController
-        ? initialPromptAndLiveInput(retryPrompt, inputController)
-        : retryPrompt;
-      const query = queryFn({ prompt: sdkPrompt, options: sdkOptions });
+      // Adopting a park makes this prompt a priority-now steer into a query that is
+      // already running. That reuses the steer accounting below verbatim: the SDK
+      // reports the interrupted work as an empty successful result, deliveredCount
+      // moves, and text produced before the push is discarded as belonging to the
+      // interrupted response rather than to this answer.
+      let query: ParkedQuery | undefined;
+      let adopting = false;
+      if (adoptedQuery && inputController) {
+        try {
+          inputController.push(retryPrompt, "now");
+          query = adoptedQuery;
+          adopting = true;
+          bridgeLog(
+            "park",
+            `steered new prompt into parked query session=${adoptedQuery.providerSessionId ?? sessionId}`,
+          );
+        } catch (error) {
+          bridgeLog(
+            "park",
+            `could not steer into parked query, opening a fresh one: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          adoptedQuery.close();
+          query = undefined;
+        }
+        adoptedQuery = undefined;
+      }
+      if (!query) {
+        inputController?.reopen();
+        const sdkPrompt = inputController
+          ? initialPromptAndLiveInput(retryPrompt, inputController)
+          : retryPrompt;
+        query = new ParkedQuery(
+          queryFn({ prompt: sdkPrompt, options: sdkOptions }),
+          inputController,
+          activeProviderSessionId,
+        );
+      }
       activeQuery = query;
+      replayOriginalPrompt = false;
       let sawResult = false;
       let sawTerminalResult = false;
       let finalAssistantText = "";
@@ -719,15 +926,26 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         }
       } finally {
         // A parked query outlives this generator: the drain closes it (and the
-        // input controller) when the CLI goes quiet, the cap hits, or the adapter
-        // closes the controller to make room for the next turn.
+        // input controller) when the CLI goes quiet, the cap hits, or the next
+        // turn adopts it.
         if (!parked) {
-          inputController?.close();
-          query.close?.();
+          activeQuery?.close();
         }
       }
 
       if (!sawResult) {
+        if (adopting && attempt === 0) {
+          // The park looked alive but its CLI was already gone, so the steer went
+          // nowhere. The user's prompt has not run: re-send it to a fresh query
+          // rather than reporting a crash for something that never started.
+          replayOriginalPrompt = true;
+          retryEmptySuccess = true;
+          bridgeLog(
+            "park",
+            `adopted query produced no result; retrying with a fresh query session=${activeProviderSessionId ?? sessionId}`,
+          );
+          continue;
+        }
         yield {
           type: "error",
           sessionId,
@@ -769,18 +987,18 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
     if (parked && activeQuery) {
       // Single launch site for the parked drain: every exit path funnels here,
       // so the query can never be parked without a reader and never leaked.
-      options.onParkStateChanged?.(true);
+      const handle = activeQuery;
+      handle.providerSessionId = activeProviderSessionId ?? handle.providerSessionId;
+      options.onParkStateChanged?.(true, handle);
       void drainParkedSdkQuery({
-        query: activeQuery,
-        inputController,
+        handle,
         parkIdleMs,
         hardCapMs: options.parkHardCapMs ?? PARK_HARD_CAP_MS,
         onEvent: (event) => options.onParkedEvent?.(event),
-        providerSessionId: activeProviderSessionId,
         sessionId,
         jobId,
       }).finally(() => {
-        options.onParkStateChanged?.(false);
+        options.onParkStateChanged?.(false, handle);
       });
     } else {
       inputController?.close();

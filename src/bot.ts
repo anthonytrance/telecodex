@@ -891,23 +891,29 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
     let contextKey: TelegramContextKey | undefined;
-    for (const [key, descriptor] of claudeSessions) {
-      if (descriptor.id === sessionId) {
+    let descriptor: AgentSessionDescriptor | undefined;
+    for (const [key, candidate] of claudeSessions) {
+      if (candidate.id === sessionId) {
         contextKey = key;
+        descriptor = candidate;
         break;
       }
     }
-    if (!contextKey) {
+    if (!contextKey || !descriptor) {
       return;
     }
     if (isProviderBusy(contextKey, "claude")) {
-      outputBuffer.append(sessionId, {
+      // Buffer under the AGENT SESSION id, not the provider descriptor id: those
+      // are different namespaces and /replay drains by the former, so keying this
+      // on sessionId filed parked output where nothing would ever read it.
+      const bufferKey = outputBufferSessionId(contextKey, descriptor);
+      outputBuffer.append(bufferKey, {
         kind: "assistant",
         text,
         priority: false,
         metadata: { provider: "claude" },
       });
-      bridgeLog("park", `buffered parked claude output session=${sessionId} chars=${text.length}`);
+      bridgeLog("park", `buffered parked claude output session=${bufferKey} chars=${text.length}`);
       return;
     }
     const parsed = parseContextKey(contextKey);

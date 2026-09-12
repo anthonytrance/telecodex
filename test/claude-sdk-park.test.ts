@@ -1,4 +1,6 @@
 import {
+  ClaudeSdkInputController,
+  ParkedQuery,
   runClaudeSdkTurn,
   type SdkMessageLike,
 } from "../src/providers/claude-sdk-engine.js";
@@ -68,15 +70,37 @@ function controlledQuery() {
   };
 
   const seen: Array<{ prompt: unknown; options: Record<string, unknown> }> = [];
+  // The real SDK consumes the prompt iterable, which is what moves the input
+  // controller's deliveredCount and therefore drives the engine's steer
+  // accounting. A fake that ignores the iterable leaves deliveredCount at 0 and
+  // silently skips the very logic an adopted (steered) turn depends on.
+  const deliveredPrompts: unknown[] = [];
   const queryFn = (input: { prompt: unknown; options: Record<string, unknown> }) => {
     seen.push(input);
+    const prompt = input.prompt;
+    if (prompt && typeof prompt === "object" && Symbol.asyncIterator in prompt) {
+      void (async () => {
+        try {
+          for await (const message of prompt as AsyncIterable<unknown>) {
+            deliveredPrompts.push(message);
+          }
+        } catch {
+          // The controller closing mid-read is normal teardown.
+        }
+      })();
+    }
     return stream;
   };
 
   return {
     queryFn,
     seen,
+    deliveredPrompts,
     isClosed: () => closed,
+    /** Messages pushed but not yet taken by a reader. */
+    queuedCount: () => queued.length,
+    /** Readers currently blocked in next(); 1 means the drain is idle-waiting. */
+    waitingReaders: () => resolvers.length,
     push: (message: SdkMessageLike): void => {
       const resolve = resolvers.shift();
       if (resolve) {
@@ -342,5 +366,238 @@ describe("parked sdk queries", () => {
     expect(events.some((event) => event.type === "error")).toBe(true);
     expect(parkStates).toEqual([]);
     expect(controlled.isClosed()).toBe(true);
+  });
+});
+
+/**
+ * Adoption: the next prompt is steered into the still-running parked query rather
+ * than opening a second CLI process. This is the part that actually stops the
+ * "Continue from where you left off." injection, because the work the CLI queued
+ * behind the last answer is never truncated by a kill at the turn boundary.
+ */
+describe("adopting a parked sdk query", () => {
+  const parkOptions = {
+    ...baseOptions,
+    parkIdleMs: 300,
+    parkHardCapMs: 5_000,
+  };
+
+  /** Exactly what the adapter does before it starts the next turn. */
+  async function adopt(handle: ParkedQuery | undefined): Promise<ParkedQuery | undefined> {
+    if (!handle) {
+      return undefined;
+    }
+    if (await handle.takeOver()) {
+      return handle;
+    }
+    handle.close();
+    return undefined;
+  }
+
+  async function runParkedFirstTurn(
+    controlled: ReturnType<typeof controlledQuery>,
+    parkIdleMs = parkOptions.parkIdleMs,
+  ): Promise<{ inputController: ClaudeSdkInputController; handle: ParkedQuery | undefined }> {
+    const inputController = new ClaudeSdkInputController();
+    let handle: ParkedQuery | undefined;
+    controlled.push(initMessage);
+    controlled.push(textMessage("FIRST"));
+    controlled.push(successResult("FIRST"));
+    await collect(
+      runClaudeSdkTurn({
+        ...parkOptions,
+        parkIdleMs,
+        queryFn: controlled.queryFn,
+        inputController,
+        onParkedEvent: () => {},
+        onParkStateChanged: (parked, query) => {
+          if (parked) {
+            handle = query;
+          }
+        },
+      }),
+    );
+    return { inputController, handle };
+  }
+
+  it("never drops a message handed between the drain and the adopting turn", async () => {
+    const resolvers: Array<(result: IteratorResult<SdkMessageLike>) => void> = [];
+    const handle = new ParkedQuery(
+      {
+        [Symbol.asyncIterator]: () => ({
+          next: () =>
+            new Promise<IteratorResult<SdkMessageLike>>((resolve) => {
+              resolvers.push(resolve);
+            }),
+        }),
+      },
+      undefined,
+      "park-session",
+    );
+
+    // A reader asks for the next message and walks away before it arrives.
+    const abandoned = handle.next();
+    resolvers.shift()!({ value: textMessage("IN FLIGHT"), done: false });
+
+    // The next reader must receive that message, not skip past it.
+    const received = await handle.next();
+    expect(received.done).toBe(false);
+    expect(
+      (received.value as { message: { content: Array<{ text: string }> } }).message.content[0].text,
+    ).toBe("IN FLIGHT");
+    await expect(abandoned).resolves.toMatchObject({ done: false });
+  });
+
+  it("steers the next prompt into the parked query instead of opening a second one", async () => {
+    const controlled = controlledQuery();
+    const { inputController, handle } = await runParkedFirstTurn(controlled);
+    expect(controlled.seen).toHaveLength(1);
+    expect(controlled.deliveredPrompts).toHaveLength(1);
+
+    const adopted = await adopt(handle);
+    expect(adopted).toBeDefined();
+
+    const events: AgentProviderEvent[] = [];
+    const turn = (async () => {
+      for await (const event of runClaudeSdkTurn({
+        ...parkOptions,
+        promptText: "the follow-up question",
+        queryFn: controlled.queryFn,
+        inputController,
+        adoptedQuery: adopted,
+        onParkedEvent: () => {},
+        onParkStateChanged: () => {},
+      })) {
+        events.push(event);
+      }
+    })();
+
+    // The prompt reaches the SAME query as a live steer; no second query opens.
+    await waitUntil(() => controlled.deliveredPrompts.length === 2);
+    expect(controlled.seen).toHaveLength(1);
+
+    // The CLI reports the work the steer interrupted as an empty success. That
+    // must not end the turn.
+    controlled.push(successResult(""));
+    controlled.push(textMessage("SECOND"));
+    controlled.push(successResult("SECOND"));
+    await turn;
+
+    expect(
+      events.some((event) => event.type === "assistant_message_complete" && event.text === "SECOND"),
+    ).toBe(true);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    expect(controlled.seen).toHaveLength(1);
+  });
+
+  it("flushes text the drain was holding before handing the query over", async () => {
+    const controlled = controlledQuery();
+    const parkedEvents: AgentProviderEvent[] = [];
+    const inputController = new ClaudeSdkInputController();
+    let handle: ParkedQuery | undefined;
+    controlled.push(initMessage);
+    controlled.push(textMessage("FIRST"));
+    controlled.push(successResult("FIRST"));
+    await collect(
+      runClaudeSdkTurn({
+        ...parkOptions,
+        parkIdleMs: 60_000,
+        queryFn: controlled.queryFn,
+        inputController,
+        onParkedEvent: (event) => parkedEvents.push(event),
+        onParkStateChanged: (parked, query) => {
+          if (parked) {
+            handle = query;
+          }
+        },
+      }),
+    );
+
+    // Late narration with no closing result yet, so the drain is holding it.
+    controlled.push(textMessage("HELD BY THE DRAIN"));
+    await waitUntil(() => controlled.queuedCount() === 0 && controlled.waitingReaders() === 1);
+
+    const adopted = await adopt(handle);
+    expect(adopted).toBeDefined();
+
+    // The handover must not swallow it.
+    expect(
+      parkedEvents.some(
+        (event) => event.type === "assistant_message_complete" && event.text === "HELD BY THE DRAIN",
+      ),
+    ).toBe(true);
+  });
+
+  it("opens a fresh query when the park is already gone", async () => {
+    const controlled = controlledQuery();
+    const { handle } = await runParkedFirstTurn(controlled);
+    expect(handle).toBeDefined();
+
+    // The CLI exits: the drain sees the stream finish and closes the handle.
+    controlled.end();
+    await waitUntil(() => controlled.isClosed());
+
+    expect(await adopt(handle)).toBeUndefined();
+    expect(handle!.isClosed).toBe(true);
+  });
+
+  it("falls back to a fresh query with the original prompt when the adopted one is dead", async () => {
+    const controlled = controlledQuery();
+    const { inputController, handle } = await runParkedFirstTurn(controlled, 60_000);
+    const adopted = await adopt(handle);
+    expect(adopted).toBeDefined();
+
+    // Adoption succeeded, but the CLI dies before answering the steer.
+    controlled.end();
+
+    const events = await collect(
+      runClaudeSdkTurn({
+        ...parkOptions,
+        promptText: "the follow-up question",
+        queryFn: controlled.queryFn,
+        inputController,
+        adoptedQuery: adopted,
+        onParkedEvent: () => {},
+        onParkStateChanged: () => {},
+      }),
+    );
+
+    // A second query was opened rather than reporting a crash for a prompt that
+    // never actually ran.
+    expect(controlled.seen).toHaveLength(2);
+    expect(events.some((event) => event.type === "error")).toBe(true);
+  });
+
+  it("re-parks after an adopted turn so the prompt after it can steer in too", async () => {
+    const controlled = controlledQuery();
+    const { inputController, handle } = await runParkedFirstTurn(controlled);
+    const adopted = await adopt(handle);
+    expect(adopted).toBeDefined();
+
+    let reparked: ParkedQuery | undefined;
+    const turn = collect(
+      runClaudeSdkTurn({
+        ...parkOptions,
+        promptText: "the follow-up question",
+        queryFn: controlled.queryFn,
+        inputController,
+        adoptedQuery: adopted,
+        onParkedEvent: () => {},
+        onParkStateChanged: (parked, query) => {
+          if (parked) {
+            reparked = query;
+          }
+        },
+      }),
+    );
+
+    await waitUntil(() => controlled.deliveredPrompts.length === 2);
+    controlled.push(textMessage("SECOND"));
+    controlled.push(successResult("SECOND"));
+    await turn;
+
+    expect(reparked).toBe(adopted);
+    expect(controlled.isClosed()).toBe(false);
+    expect(await reparked!.takeOver()).toBe(true);
   });
 });

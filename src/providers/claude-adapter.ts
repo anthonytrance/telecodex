@@ -138,6 +138,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
    * legacy behavior of killing the process and losing the work.
    */
   private outOfBandHandler?: (sessionId: string, event: AgentProviderEvent) => void;
+  private parkActivityHandler?: (sessionId: string, active: boolean) => void;
 
   constructor(private readonly config: TeleCodeConfig) {
     this.processRegistry = new ClaudeProcessRegistry(claudeProcessRegistryPath(config.workspace));
@@ -145,6 +146,21 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
   setOutOfBandHandler(handler: (sessionId: string, event: AgentProviderEvent) => void): void {
     this.outOfBandHandler = handler;
+  }
+
+  /**
+   * Told whether a parked session's CLI is working right now. The bridge treats an
+   * active park as a busy lane: the user's next plain message is then offered as a
+   * steer instead of being dispatched as a turn that would silently steer itself
+   * into work already in flight.
+   */
+  setParkActivityHandler(handler: (sessionId: string, active: boolean) => void): void {
+    this.parkActivityHandler = handler;
+  }
+
+  /** True while this session has a parked query whose CLI is mid-turn. */
+  isParkActive(sessionId: string): boolean {
+    return this.sessions.get(sessionId)?.parkedQuery?.isActive === true;
   }
 
   async createSession(
@@ -399,6 +415,21 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       throw new Error("Claude steer text is empty");
     }
     if (!runtime.busy) {
+      // No turn is running, but a parked query can still have the CLI mid-flight
+      // on work it queued behind the last answer. That IS a running turn from the
+      // user's side, and it is steerable: push into the same input stream the
+      // parked drain is reading, so the reply comes back as parked output.
+      const parked = runtime.parkedQuery;
+      if (
+        runtime.backend === "sdk" &&
+        parked?.isActive === true &&
+        !parked.isClosed &&
+        parked.inputController?.isClosed === false
+      ) {
+        parked.inputController.push(text, "now");
+        bridgeLog("steer", `sdk steer into parked turn session=${runtime.providerSessionId} chars=${text.length}`);
+        return;
+      }
       throw new Error("No active Claude turn to steer");
     }
 
@@ -539,6 +570,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         parkIdleMs: this.config.claudeParkIdleMs,
         adoptedQuery,
         onParkedEvent: (event) => this.handleParkedEvent(runtime, event),
+        onParkActivityChanged: (active) => {
+          this.parkActivityHandler?.(runtime.descriptor.id, active);
+        },
         onParkStateChanged: (isParked, query) => {
           if (isParked) {
             runtime.parkedQuery = query;

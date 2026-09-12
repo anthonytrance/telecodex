@@ -601,3 +601,151 @@ describe("adopting a parked sdk query", () => {
     expect(await reparked!.takeOver()).toBe(true);
   });
 });
+
+/**
+ * A park is not just a mailbox for late text. When the CLI picks up queued work
+ * it is genuinely running a turn, and both facts have to reach the bridge while
+ * it happens: the text as it is produced, and the fact that Claude is busy.
+ * Holding either until the injected turn's result left the user staring at a
+ * silent chat for minutes and let his next message steer work he never saw.
+ */
+describe("parked drain liveness", () => {
+  const liveParkOptions = {
+    ...baseOptions,
+    parkIdleMs: 3_000,
+    parkHardCapMs: 10_000,
+    parkFlushDebounceMs: 40,
+  };
+
+  it("sends parked text as it is produced instead of holding it until the result", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+
+    const parkedEvents: AgentProviderEvent[] = [];
+    const parkStates: boolean[] = [];
+    await collect(
+      runClaudeSdkTurn({
+        ...liveParkOptions,
+        queryFn: controlled.queryFn,
+        onParkedEvent: (event) => parkedEvents.push(event),
+        onParkStateChanged: (parked) => parkStates.push(parked),
+      }),
+    );
+
+    // The injected turn starts talking but has not finished: no result yet.
+    controlled.push(textMessage("WORKING ON IT"));
+
+    await waitUntil(() =>
+      parkedEvents.some((event) => event.type === "assistant_message_complete" && event.text === "WORKING ON IT"),
+    );
+    // Delivered while the park is still open, not as part of its teardown.
+    expect(parkStates).toEqual([true]);
+    expect(controlled.isClosed()).toBe(false);
+  });
+
+  it("reports the parked cli busy while it works and idle again at the result", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+
+    const activity: boolean[] = [];
+    let parkedQuery: ParkedQuery | undefined;
+    await collect(
+      runClaudeSdkTurn({
+        ...liveParkOptions,
+        queryFn: controlled.queryFn,
+        onParkedEvent: () => {},
+        onParkActivityChanged: (active) => activity.push(active),
+        onParkStateChanged: (parked, query) => {
+          if (parked) {
+            parkedQuery = query;
+          }
+        },
+      }),
+    );
+
+    expect(activity).toEqual([]);
+    expect(parkedQuery?.isActive).toBe(false);
+
+    controlled.push(textMessage("PICKED UP QUEUED WORK"));
+    await waitUntil(() => activity.length === 1);
+    expect(activity).toEqual([true]);
+    expect(parkedQuery?.isActive).toBe(true);
+
+    controlled.push(successResult("PICKED UP QUEUED WORK"));
+    await waitUntil(() => activity.length === 2);
+    expect(activity).toEqual([true, false]);
+    expect(parkedQuery?.isActive).toBe(false);
+  });
+
+  it("accepts a steer pushed into an active park and answers it through the drain", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+
+    const inputController = new ClaudeSdkInputController();
+    const parkedEvents: AgentProviderEvent[] = [];
+    let parkedQuery: ParkedQuery | undefined;
+    await collect(
+      runClaudeSdkTurn({
+        ...liveParkOptions,
+        queryFn: controlled.queryFn,
+        inputController,
+        onParkedEvent: (event) => parkedEvents.push(event),
+        onParkStateChanged: (parked, query) => {
+          if (parked) {
+            parkedQuery = query;
+          }
+        },
+      }),
+    );
+
+    // The park owns the input stream now, and it is still open: this is the path
+    // an explicit steer takes when the CLI is mid-turn with no bridge turn running.
+    expect(parkedQuery?.inputController).toBe(inputController);
+    expect(inputController.isClosed).toBe(false);
+
+    const deliveredBefore = controlled.deliveredPrompts.length;
+    inputController.push("stop and check the log", "now");
+    await waitUntil(() => controlled.deliveredPrompts.length > deliveredBefore);
+
+    controlled.push(textMessage("CHECKED THE LOG"));
+    await waitUntil(() =>
+      parkedEvents.some((event) => event.type === "assistant_message_complete" && event.text === "CHECKED THE LOG"),
+    );
+  });
+
+  it("does not repeat the closing paragraph when a result closes several blocks", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+
+    const parkedEvents: AgentProviderEvent[] = [];
+    await collect(
+      runClaudeSdkTurn({
+        ...baseOptions,
+        parkIdleMs: 3_000,
+        parkHardCapMs: 10_000,
+        // No debounce flush in between: the blocks reach the result together,
+        // which is the shape that used to duplicate the final one.
+        parkFlushDebounceMs: 5_000,
+        queryFn: controlled.queryFn,
+        onParkedEvent: (event) => parkedEvents.push(event),
+      }),
+    );
+
+    controlled.push(textMessage("FIRST PART"));
+    controlled.push(textMessage("SECOND PART"));
+    controlled.push(successResult("SECOND PART"));
+
+    await waitUntil(() => parkedEvents.some((event) => event.type === "assistant_message_complete"));
+    const delivered = parkedEvents.filter((event) => event.type === "assistant_message_complete");
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.text).toBe(["FIRST PART", "SECOND PART"].join("\n\n"));
+  });
+});

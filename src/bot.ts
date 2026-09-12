@@ -848,6 +848,27 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const isProviderBusy = (contextKey: TelegramContextKey, provider: AgentProviderKind): boolean =>
     busyProviders.get(contextKey)?.has(provider) ?? false;
 
+  // Claude SESSIONS with no running turn but a PARKED query whose CLI is mid-turn.
+  // Claude is genuinely working there, so the lane has to behave as busy. Keyed by
+  // session id, not by lane: an entry left behind by a session the lane has since
+  // replaced (/new, /switch) then simply stops matching, instead of wedging the
+  // lane as permanently busy with no way back.
+  const claudeParkActiveSessions = new Set<string>();
+
+  /**
+   * Claude is working on this lane: a turn is running, or a parked query is
+   * mid-turn. Both must hold the user's next plain message and offer the steer,
+   * exactly as Codex does. Dispatching a turn into an active park instead steers
+   * work the user never agreed to steer, with no notice that anything was running.
+   */
+  const isClaudeWorking = (contextKey: TelegramContextKey): boolean => {
+    if (isProviderBusy(contextKey, "claude")) {
+      return true;
+    }
+    const descriptor = claudeSessions.get(contextKey);
+    return descriptor ? claudeParkActiveSessions.has(descriptor.id) : false;
+  };
+
   const isAnyProviderBusy = (contextKey: TelegramContextKey): boolean =>
     (busyProviders.get(contextKey)?.size ?? 0) > 0;
 
@@ -882,6 +903,17 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   // task notification the CLI acted on once idle). Deliver that text on the lane:
   // straight to the chat when the lane is idle, buffered for /replay when a turn
   // is running. Everything but finished text stays in the transcript.
+  const findClaudeLaneBySessionId = (
+    sessionId: string,
+  ): { contextKey: TelegramContextKey; descriptor: AgentSessionDescriptor } | undefined => {
+    for (const [contextKey, descriptor] of claudeSessions) {
+      if (descriptor.id === sessionId) {
+        return { contextKey, descriptor };
+      }
+    }
+    return undefined;
+  };
+
   const deliverParkedClaudeEvent = (sessionId: string, event: AgentProviderEvent): void => {
     if (event.type !== "assistant_message_complete") {
       return;
@@ -890,18 +922,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (!text) {
       return;
     }
-    let contextKey: TelegramContextKey | undefined;
-    let descriptor: AgentSessionDescriptor | undefined;
-    for (const [key, candidate] of claudeSessions) {
-      if (candidate.id === sessionId) {
-        contextKey = key;
-        descriptor = candidate;
-        break;
-      }
-    }
-    if (!contextKey || !descriptor) {
+    const lane = findClaudeLaneBySessionId(sessionId);
+    if (!lane) {
       return;
     }
+    const { contextKey, descriptor } = lane;
     if (isProviderBusy(contextKey, "claude")) {
       // Buffer under the AGENT SESSION id, not the provider descriptor id: those
       // are different namespaces and /replay drains by the former, so keying this
@@ -911,7 +936,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         kind: "assistant",
         text,
         priority: false,
-        metadata: { provider: "claude" },
+        metadata: { provider: "claude", parked: true },
       });
       bridgeLog("park", `buffered parked claude output session=${bufferKey} chars=${text.length}`);
       return;
@@ -934,6 +959,60 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
   if (typeof claudeAdapter?.setOutOfBandHandler === "function") {
     claudeAdapter.setOutOfBandHandler(deliverParkedClaudeEvent);
+  }
+
+  /**
+   * Parked output that arrived while a turn was running was buffered rather than
+   * sent. Only an explicit /replay drained it, so text the user never asked to be
+   * hidden could sit there unread forever. Send it as soon as the lane is free.
+   */
+  const flushBufferedParkedClaude = async (contextKey: TelegramContextKey): Promise<void> => {
+    const descriptor = claudeSessions.get(contextKey);
+    if (!descriptor) {
+      return;
+    }
+    const events = outputBuffer.drainWhere(
+      outputBufferSessionId(contextKey, descriptor),
+      (event) => event.metadata?.parked === true && event.metadata?.provider === "claude",
+    );
+    if (events.length === 0) {
+      return;
+    }
+    const parsed = parseContextKey(contextKey);
+    for (const event of events) {
+      const text = event.text?.trim();
+      if (!text) {
+        continue;
+      }
+      for (const chunk of splitMarkdownForTelegram(text)) {
+        await sendTextMessage(bot.api, parsed.chatId, chunk.text, {
+          parseMode: chunk.parseMode,
+          fallbackText: chunk.fallbackText,
+          messageThreadId: parsed.messageThreadId,
+        });
+      }
+    }
+    bridgeLog("park", `flushed ${events.length} buffered parked claude message(s) lane=${contextKey}`);
+  };
+
+  if (typeof claudeAdapter?.setParkActivityHandler === "function") {
+    claudeAdapter.setParkActivityHandler((sessionId, active) => {
+      if (active) {
+        claudeParkActiveSessions.add(sessionId);
+      } else {
+        claudeParkActiveSessions.delete(sessionId);
+      }
+      const lane = findClaudeLaneBySessionId(sessionId);
+      bridgeLog(
+        "park",
+        `parked claude turn ${active ? "started" : "finished"} session=${sessionId} lane=${lane?.contextKey ?? "unknown"}`,
+      );
+      if (!lane || active) {
+        return;
+      }
+      // Anything the user parked in the queue while the CLI was working runs now.
+      dispatchNextQueuedClaudePrompt(lane.contextKey);
+    });
   }
 
   const persistAgentSessionState = (): void => {
@@ -1692,7 +1771,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   ): Promise<void> => {
     const messageThreadId = source.messageThreadId ?? parseContextKey(contextKey).messageThreadId;
     let liveSteerError: string | undefined;
-    if (isProviderBusy(contextKey, "claude") || getBusyState(contextKey).processing) {
+    if (isClaudeWorking(contextKey) || getBusyState(contextKey).processing) {
       const descriptor = claudeSessions.get(contextKey);
       if (descriptor && claudeAdapter?.streamInput) {
         try {
@@ -2882,8 +2961,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         }
         return;
       }
-      if (isProviderBusy(contextKey, "claude")) {
-        bridgeLog("intake", `queued (provider busy) lane=${contextKey} depth=${queuedClaudePrompts.depth(contextKey) + 1}`);
+      if (isClaudeWorking(contextKey)) {
+        bridgeLog("intake", `queued (claude working) lane=${contextKey} depth=${queuedClaudePrompts.depth(contextKey) + 1}`);
         if (source.ctx) {
           lastPromptInput.set(contextKey, text);
           await queueClaudePromptReply(source.ctx, contextKey, source.chatId, text);
@@ -3441,6 +3520,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       );
       markProviderBusy(contextKey, "claude", false);
       busyState.processing = false;
+      try {
+        await flushBufferedParkedClaude(contextKey);
+      } catch (flushError) {
+        console.warn("Failed to flush buffered parked Claude output", flushError);
+      }
       if (!deferQueuedDispatch) {
         dispatchNextQueuedClaudePrompt(contextKey);
       }
@@ -3476,7 +3560,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   };
 
   const dispatchNextQueuedClaudePrompt = (contextKey: TelegramContextKey): void => {
-    if (!claudeAdapter || isProviderBusy(contextKey, "claude") || getBusyState(contextKey).processing) {
+    if (!claudeAdapter || isClaudeWorking(contextKey) || getBusyState(contextKey).processing) {
       return;
     }
     const queued = queuedClaudePrompts.dequeue(contextKey);
@@ -5196,7 +5280,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         await reply("Dropped the queued message. Nothing was sent to Claude.");
         return;
       }
-      if (!isProviderBusy(contextKey, "claude") && !getBusyState(contextKey).processing) {
+      if (!isClaudeWorking(contextKey) && !getBusyState(contextKey).processing) {
         await reply("The turn already finished, so your message is starting now as a normal prompt.");
         return;
       }

@@ -56,10 +56,20 @@ export interface ClaudeSdkTurnOptions {
   parkIdleMs?: number;
   /** Absolute ceiling on one park, whatever the traffic. Defaults to PARK_HARD_CAP_MS. */
   parkHardCapMs?: number;
+  /** How long the parked drain groups text before sending. Defaults to PARK_FLUSH_DEBOUNCE_MS. */
+  parkFlushDebounceMs?: number;
   /** Receives events the CLI produced after the turn's answer (parked drain). */
   onParkedEvent?: (event: AgentProviderEvent) => void;
   /** Signals when the parked drain takes and releases the query + input controller. */
   onParkStateChanged?: (parked: boolean, query: ParkedQuery) => void;
+  /**
+   * Signals whether the parked CLI is doing work right now (true from the first
+   * message of an injected turn until that turn's result). A park that is merely
+   * waiting is idle; a park mid-turn is Claude actively working, and the bridge
+   * must treat the lane as busy so the next message is offered as a steer rather
+   * than silently pushed into the running turn.
+   */
+  onParkActivityChanged?: (active: boolean) => void;
   /**
    * A still-live query parked by this session's previous turn, already handed over
    * by the caller via takeOver(). When set, this turn steers the prompt into that
@@ -309,6 +319,16 @@ export const PARK_HARD_CAP_MS = 30 * 60_000;
 export const PARK_HANDOVER_TIMEOUT_MS = 5_000;
 
 /**
+ * How long the parked drain groups assistant text before sending it.
+ *
+ * Text used to be held until the injected turn's result message, which on a long
+ * sub-turn meant minutes of silence while the CLI was visibly working. Grouping
+ * for a beat keeps a rapid burst in one Telegram message without ever holding
+ * finished narration hostage to a result that has not happened yet.
+ */
+export const PARK_FLUSH_DEBOUNCE_MS = 1_500;
+
+/**
  * A live SDK query that outlives the turn that opened it. Two readers take turns
  * on it: the parked drain between turns, and runClaudeSdkTurn again when the next
  * prompt adopts the park instead of opening a fresh query.
@@ -322,6 +342,7 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
   private readonly iterator: AsyncIterator<SdkMessageLike>;
   private pending?: Promise<IteratorResult<SdkMessageLike>>;
   private closed = false;
+  private active = false;
   private draining = false;
   private handoverWanted = false;
   private signalHandover?: () => void;
@@ -363,6 +384,15 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
   /** True once a turn asked to adopt this query; the drain must then let go. */
   get handoverRequested(): boolean {
     return this.handoverWanted;
+  }
+
+  /** True while the parked CLI is mid-turn, i.e. genuinely working right now. */
+  get isActive(): boolean {
+    return this.active;
+  }
+
+  setActive(active: boolean): void {
+    this.active = active;
   }
 
   /** Called by the drain as it takes the stream; re-arms after a previous handover. */
@@ -494,19 +524,38 @@ async function drainParkedSdkQuery(args: {
   handle: ParkedQuery;
   parkIdleMs: number;
   hardCapMs: number;
+  flushDebounceMs?: number;
   onEvent: (event: AgentProviderEvent) => void;
+  onActivityChanged?: (active: boolean) => void;
   sessionId: string;
   jobId: string;
 }): Promise<void> {
   const startedAt = Date.now();
   const sessionLabel = args.handle.providerSessionId ?? args.sessionId;
+  const flushDebounceMs = args.flushDebounceMs ?? PARK_FLUSH_DEBOUNCE_MS;
   args.handle.beginDrain();
   bridgeLog("park", `keeping finished sdk query alive session=${sessionLabel} idleMs=${args.parkIdleMs}`);
+  let active = false;
+  // A park that is merely waiting is idle. A park that is mid-injected-turn is
+  // Claude working, and the bridge has to know the difference: the lane must look
+  // busy then, or the user's next message is dispatched as a new turn and ends up
+  // steering running work he never agreed to steer.
+  const setActive = (next: boolean): void => {
+    if (active === next) {
+      return;
+    }
+    active = next;
+    args.handle.setActive(next);
+    bridgeLog("park", `parked cli ${next ? "busy" : "idle"} session=${sessionLabel}`);
+    args.onActivityChanged?.(next);
+  };
   try {
     let bufferedText = "";
+    let flushDeadline: number | undefined;
     const flushText = (): void => {
       const text = bufferedText.trim();
       bufferedText = "";
+      flushDeadline = undefined;
       if (text) {
         args.onEvent({
           type: "assistant_message_complete",
@@ -517,23 +566,46 @@ async function drainParkedSdkQuery(args: {
       }
     };
     while (true) {
-      const remaining = Math.min(args.parkIdleMs, args.hardCapMs - (Date.now() - startedAt));
-      if (remaining <= 0) {
+      const now = Date.now();
+      const idleRemaining = Math.min(args.parkIdleMs, args.hardCapMs - (now - startedAt));
+      if (idleRemaining <= 0) {
         break;
       }
-      const outcome = await waitForParkedMessage(args.handle, remaining);
+      // Text waiting to be grouped shortens the wait. Timing out on THAT deadline
+      // means "send what you have and keep going", not "the park is over", so the
+      // two cases must stay distinguishable after the race resolves.
+      let waitMs = idleRemaining;
+      let waitingForFlush = false;
+      if (flushDeadline !== undefined) {
+        const flushRemaining = Math.max(0, flushDeadline - now);
+        if (flushRemaining < idleRemaining) {
+          waitMs = flushRemaining;
+          waitingForFlush = true;
+        }
+      }
+      const outcome = await waitForParkedMessage(args.handle, waitMs);
       if (outcome.kind === "handover") {
         // The next turn is adopting this query. Flush whatever the CLI said since
         // the last result before letting go, or that text dies with the drain.
         flushText();
         break;
       }
-      // Timeout = park went quiet (or hit its cap); done = the query finished
-      // (input closed from outside, CLI exited). Either way the park is over.
-      if (outcome.kind === "timeout" || outcome.result.done) {
+      if (outcome.kind === "timeout") {
+        if (waitingForFlush) {
+          flushText();
+          continue;
+        }
+        // Park went quiet (or hit its cap). The park is over.
+        break;
+      }
+      if (outcome.result.done) {
+        // The query finished: input closed from outside, or the CLI exited.
         break;
       }
       const message = outcome.result.value;
+      if (message.type !== "result") {
+        setActive(true);
+      }
       if (message.type === "assistant") {
         const model = message.message?.model;
         if (!model || model === "<synthetic>") {
@@ -543,6 +615,7 @@ async function drainParkedSdkQuery(args: {
           const blockType = typeof block.type === "string" ? block.type : "";
           if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
             bufferedText += `${bufferedText ? "\n\n" : ""}${block.text.trim()}`;
+            flushDeadline = Date.now() + flushDebounceMs;
           } else if (blockType === "tool_use") {
             args.onEvent({
               type: "tool_started",
@@ -573,14 +646,16 @@ async function drainParkedSdkQuery(args: {
           bridgeLog("park", `parked sdk turn ended: ${message.subtype ?? "?"} session=${sessionLabel}`);
           break;
         }
-        // A result closes an injected turn. Its text usually repeats the assistant
-        // blocks already buffered, so append only what is genuinely new, then
-        // deliver the burst now instead of holding it until the park times out.
+        // A result closes an injected turn and repeats the assistant text it
+        // closed. Append only what is genuinely new: comparing the result against
+        // the whole accumulated buffer instead of its contents duplicated the last
+        // paragraph of every multi-block parked delivery.
         const resultText = (message.result ?? "").trim();
-        if (resultText && resultText !== bufferedText.trim()) {
+        if (resultText && !bufferedText.includes(resultText)) {
           bufferedText += `${bufferedText ? "\n\n" : ""}${resultText}`;
         }
         flushText();
+        setActive(false);
         continue;
       }
     }
@@ -591,6 +666,7 @@ async function drainParkedSdkQuery(args: {
       `park drain failed (turn unaffected): ${error instanceof Error ? error.message : String(error)} session=${sessionLabel}`,
     );
   } finally {
+    setActive(false);
     // Close BEFORE releasing the drain: a takeOver() waiting on drainFinished then
     // observes the closed handle and opens a fresh query instead of pushing a
     // prompt into a stream nobody is reading.
@@ -994,7 +1070,9 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         handle,
         parkIdleMs,
         hardCapMs: options.parkHardCapMs ?? PARK_HARD_CAP_MS,
+        flushDebounceMs: options.parkFlushDebounceMs,
         onEvent: (event) => options.onParkedEvent?.(event),
+        onActivityChanged: (active) => options.onParkActivityChanged?.(active),
         sessionId,
         jobId,
       }).finally(() => {

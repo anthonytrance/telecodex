@@ -46,6 +46,7 @@ const mockClaude = vi.hoisted(() => {
   let failNextPromptDelivery = false;
   let artifactFileName: string | undefined;
   let outOfBandHandler: ((sessionId: string, event: Record<string, unknown>) => void) | undefined;
+  let parkActivityHandler: ((sessionId: string, active: boolean) => void) | undefined;
 
   return {
     prompts,
@@ -61,6 +62,12 @@ const mockClaude = vi.hoisted(() => {
     },
     emitOutOfBand: (sessionId: string, event: Record<string, unknown>): void => {
       outOfBandHandler?.(sessionId, event);
+    },
+    setParkActivityHandler: (handler: ((sessionId: string, active: boolean) => void) | undefined) => {
+      parkActivityHandler = handler;
+    },
+    emitParkActivity: (sessionId: string, active: boolean): void => {
+      parkActivityHandler?.(sessionId, active);
     },
     createSession,
     resumeSession,
@@ -138,6 +145,7 @@ const mockClaude = vi.hoisted(() => {
       failNextPromptDelivery = false;
       artifactFileName = undefined;
       outOfBandHandler = undefined;
+      parkActivityHandler = undefined;
       createSession.mockReset();
       resumeSession.mockReset();
       getSessionInfo.mockReset();
@@ -205,6 +213,10 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
 
     setOutOfBandHandler(handler: (sessionId: string, event: Record<string, unknown>) => void) {
       mockClaude.setOutOfBandHandler(handler);
+    }
+
+    setParkActivityHandler(handler: (sessionId: string, active: boolean) => void) {
+      mockClaude.setParkActivityHandler(handler);
     }
 
     async resumeSession(session: unknown) {
@@ -1478,7 +1490,7 @@ describe("Claude bot flow", () => {
     });
   });
 
-  it("buffers parked output arriving mid-turn where /replay can actually find it", async () => {
+  it("buffers parked output arriving mid-turn, then delivers it once the lane frees up", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
     await bot.handleUpdate(textUpdate(1, "/claude"));
@@ -1486,7 +1498,7 @@ describe("Claude bot flow", () => {
     await bot.handleUpdate(textUpdate(2, "busy turn"));
     await waitFor(() => mockClaude.prompts.includes("busy turn"));
 
-    // The lane is busy, so this goes to the replay buffer rather than the chat.
+    // The lane is busy, so this is buffered rather than cutting into the turn.
     // It has to be filed under the AGENT SESSION id: keying it on the provider
     // descriptor id put it in a bucket /replay never drains, which lost exactly
     // the late answers parking exists to rescue.
@@ -1498,15 +1510,76 @@ describe("Claude bot flow", () => {
     });
 
     mockClaude.releaseBlockedPrompt();
-    await waitFor(() => mockClaude.prompts.includes("busy turn") && sent.length > 0);
-    // Buffered, not sent: it must surface through /replay, not interrupt the turn.
-    expect(sent.some((entry) => entry.text?.includes("PARKED_WHILE_BUSY"))).toBe(false);
 
-    await bot.handleUpdate(textUpdate(3, "/replay all"));
+    // ...and it is sent on its own as soon as the turn ends. Leaving it to sit
+    // until someone typed /replay meant real answers were silently never read.
     await waitFor(() => sent.some((entry) => entry.text?.includes("PARKED_WHILE_BUSY")));
+    const delivered = sent.filter((entry) => entry.text?.includes("PARKED_WHILE_BUSY"));
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.text).not.toContain("Buffered Claude output");
+  });
 
-    const replay = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Buffered Claude output"));
-    expect(replay.join("\n")).toContain("PARKED_WHILE_BUSY");
+  /**
+   * A parked query whose CLI picked up queued work is a running turn from the
+   * user's side. His next plain message must be held and offered as a steer,
+   * exactly as Codex does, not dispatched as a turn that silently steers work
+   * already in flight while telling him nothing was running.
+   */
+  it("holds a plain message and offers the steer while a parked Claude turn is working", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "first turn"));
+    await waitFor(() => mockClaude.prompts.includes("first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+
+    mockClaude.emitParkActivity("claude-provider-1", true);
+    await bot.handleUpdate(textUpdate(3, "are you still going"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Claude is still working")));
+
+    expect(mockClaude.prompts).not.toContain("are you still going");
+    const notice = sent.map((entry) => entry.text ?? "").find((text) => text.includes("Claude is still working"));
+    expect(notice).toContain("Send s to steer it into the running turn");
+
+    // The park goes idle and the held message runs on its own.
+    mockClaude.emitParkActivity("claude-provider-1", false);
+    await waitFor(() => mockClaude.prompts.includes("are you still going"));
+  });
+
+  it("does not wedge the lane when the session a park belonged to is replaced", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to first turn")));
+    await waitForAgentSessionsIdle(tempDir);
+
+    // The park is working, then the session it belonged to is thrown away. The
+    // busy flag must go with it: a leftover entry that still matched the lane
+    // would hold every later message in the queue with nothing to release it.
+    mockClaude.emitParkActivity("claude-provider-1", true);
+    await bot.handleUpdate(textUpdate(2, "/new claude"));
+    await waitForAgentSessionsIdle(tempDir);
+
+    await bot.handleUpdate(textUpdate(3, "fresh start"));
+    await waitFor(() => mockClaude.prompts.includes("fresh start"));
+  });
+
+  it("steers the held message into the parked turn when the user answers s", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "first turn"));
+    await waitFor(() => mockClaude.prompts.includes("first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+
+    mockClaude.emitParkActivity("claude-provider-1", true);
+    await bot.handleUpdate(textUpdate(3, "stop and check the log"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Claude is still working")));
+
+    await bot.handleUpdate(textUpdate(4, "s"));
+    await waitFor(() => mockClaude.steers.includes("stop and check the log"));
+    expect(sent.some((entry) => entry.text?.includes("Steer sent to the active Claude turn"))).toBe(true);
+    expect(mockClaude.prompts).not.toContain("stop and check the log");
   });
 
   it("drops parked output for a session the lane does not know", async () => {

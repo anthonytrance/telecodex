@@ -58,6 +58,8 @@ export interface ClaudeSdkTurnOptions {
   parkHardCapMs?: number;
   /** How long the parked drain groups text before sending. Defaults to PARK_FLUSH_DEBOUNCE_MS. */
   parkFlushDebounceMs?: number;
+  /** Ceiling on how long the parked drain may hold text. Defaults to PARK_FLUSH_MAX_HOLD_MS. */
+  parkFlushMaxHoldMs?: number;
   /** Receives events the CLI produced after the turn's answer (parked drain). */
   onParkedEvent?: (event: AgentProviderEvent) => void;
   /** Signals when the parked drain takes and releases the query + input controller. */
@@ -326,7 +328,31 @@ export const PARK_HANDOVER_TIMEOUT_MS = 5_000;
  * for a beat keeps a rapid burst in one Telegram message without ever holding
  * finished narration hostage to a result that has not happened yet.
  */
-export const PARK_FLUSH_DEBOUNCE_MS = 1_500;
+export const PARK_FLUSH_DEBOUNCE_MS = 8_000;
+
+/**
+ * Ceiling on how long the debounce may keep holding text.
+ *
+ * The debounce restarts on every new block, so narration that keeps arriving just
+ * inside the window would otherwise never be sent at all. This bounds the wait so
+ * a steady stream still surfaces regularly instead of silently accumulating.
+ */
+export const PARK_FLUSH_MAX_HOLD_MS = 30_000;
+
+/**
+ * Ceiling on a park that is still waiting for a background task to report back.
+ *
+ * Claude Code ends the turn the moment it launches a background task and re-enters
+ * itself when the task notification arrives. That gap is routinely longer than the
+ * idle timeout, so such a park must outlive it, but not forever: each live park
+ * holds a CLI process open.
+ */
+export const PARK_PENDING_TASK_CAP_MS = 60 * 60_000;
+
+const TASK_ID_OPEN = "<task-id>";
+const TASK_ID_CLOSE = "</task-id>";
+const BACKGROUND_TASK_MARKER = "running in background with ID: ";
+const TASK_ID_TERMINATORS = [" ", "\n", "\r", "\t", ".", ","];
 
 /**
  * A live SDK query that outlives the turn that opened it. Two readers take turns
@@ -393,6 +419,79 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
 
   setActive(active: boolean): void {
     this.active = active;
+  }
+
+  /**
+   * Background tasks the CLI launched and has not been told the outcome of yet.
+   *
+   * Claude Code ends the turn as soon as it starts one and re-enters itself when the
+   * task notification arrives, often minutes later. A park holding one of these is
+   * waiting, not idle, and closing it on the idle timer throws the continuation away:
+   * the notification then lands on a query that no longer exists and the work is lost.
+   */
+  private readonly pendingTasks = new Set<string>();
+
+  /** How many launched background tasks have yet to report back. */
+  get pendingTaskCount(): number {
+    return this.pendingTasks.size;
+  }
+
+  /**
+   * Feed every SDK message through here to keep that set current. Launches are read
+   * from the tool result the CLI receives, completions from the task notification the
+   * CLI is re-entered with.
+   */
+  trackMessage(message: SdkMessageLike): void {
+    if (message.type !== "user") {
+      return;
+    }
+    const raw = (message.message as { content?: unknown } | undefined)?.content;
+    if (typeof raw === "string") {
+      let from = 0;
+      while (from < raw.length) {
+        const open = raw.indexOf(TASK_ID_OPEN, from);
+        if (open < 0) {
+          break;
+        }
+        const close = raw.indexOf(TASK_ID_CLOSE, open);
+        if (close < 0) {
+          break;
+        }
+        this.pendingTasks.delete(raw.slice(open + TASK_ID_OPEN.length, close).trim());
+        from = close + TASK_ID_CLOSE.length;
+      }
+      return;
+    }
+    if (!Array.isArray(raw)) {
+      return;
+    }
+    for (const entry of raw) {
+      const block = entry as Record<string, unknown>;
+      if (block.type !== "tool_result") {
+        continue;
+      }
+      const content = block.content;
+      if (typeof content !== "string") {
+        continue;
+      }
+      let from = 0;
+      while (from < content.length) {
+        const at = content.indexOf(BACKGROUND_TASK_MARKER, from);
+        if (at < 0) {
+          break;
+        }
+        const start = at + BACKGROUND_TASK_MARKER.length;
+        let end = start;
+        while (end < content.length && !TASK_ID_TERMINATORS.includes(content[end])) {
+          end += 1;
+        }
+        const id = content.slice(start, end).trim();
+        if (id) {
+          this.pendingTasks.add(id);
+        }
+        from = end + 1;
+      }
+    }
   }
 
   /** Called by the drain as it takes the stream; re-arms after a previous handover. */
@@ -525,6 +624,7 @@ async function drainParkedSdkQuery(args: {
   parkIdleMs: number;
   hardCapMs: number;
   flushDebounceMs?: number;
+  flushMaxHoldMs?: number;
   onEvent: (event: AgentProviderEvent) => void;
   onActivityChanged?: (active: boolean) => void;
   sessionId: string;
@@ -533,6 +633,7 @@ async function drainParkedSdkQuery(args: {
   const startedAt = Date.now();
   const sessionLabel = args.handle.providerSessionId ?? args.sessionId;
   const flushDebounceMs = args.flushDebounceMs ?? PARK_FLUSH_DEBOUNCE_MS;
+  const flushMaxHoldMs = args.flushMaxHoldMs ?? PARK_FLUSH_MAX_HOLD_MS;
   args.handle.beginDrain();
   bridgeLog("park", `keeping finished sdk query alive session=${sessionLabel} idleMs=${args.parkIdleMs}`);
   let active = false;
@@ -552,10 +653,12 @@ async function drainParkedSdkQuery(args: {
   try {
     let bufferedText = "";
     let flushDeadline: number | undefined;
+    let flushHardDeadline: number | undefined;
     const flushText = (): void => {
       const text = bufferedText.trim();
       bufferedText = "";
       flushDeadline = undefined;
+      flushHardDeadline = undefined;
       if (text) {
         args.onEvent({
           type: "assistant_message_complete",
@@ -567,7 +670,14 @@ async function drainParkedSdkQuery(args: {
     };
     while (true) {
       const now = Date.now();
-      const idleRemaining = Math.min(args.parkIdleMs, args.hardCapMs - (now - startedAt));
+      // A park still owed a background task result is waiting, not idle. That
+      // notification routinely lands well after the idle timeout, and closing the
+      // query first is exactly how a finished test run vanishes instead of being
+      // reported. Such a park runs on the pending cap alone.
+      const awaitingTask = args.handle.pendingTaskCount > 0;
+      const capMs = awaitingTask ? Math.max(args.hardCapMs, PARK_PENDING_TASK_CAP_MS) : args.hardCapMs;
+      const capRemaining = capMs - (now - startedAt);
+      const idleRemaining = awaitingTask ? capRemaining : Math.min(args.parkIdleMs, capRemaining);
       if (idleRemaining <= 0) {
         break;
       }
@@ -576,8 +686,13 @@ async function drainParkedSdkQuery(args: {
       // two cases must stay distinguishable after the race resolves.
       let waitMs = idleRemaining;
       let waitingForFlush = false;
-      if (flushDeadline !== undefined) {
-        const flushRemaining = Math.max(0, flushDeadline - now);
+      // The debounce restarts on every block, so a steady stream could hold text
+      // indefinitely. The hard ceiling, armed when the buffer first fills, bounds it.
+      const effectiveFlushDeadline = flushDeadline === undefined
+        ? flushHardDeadline
+        : Math.min(flushDeadline, flushHardDeadline ?? flushDeadline);
+      if (effectiveFlushDeadline !== undefined) {
+        const flushRemaining = Math.max(0, effectiveFlushDeadline - now);
         if (flushRemaining < idleRemaining) {
           waitMs = flushRemaining;
           waitingForFlush = true;
@@ -603,6 +718,7 @@ async function drainParkedSdkQuery(args: {
         break;
       }
       const message = outcome.result.value;
+      args.handle.trackMessage(message);
       if (message.type !== "result") {
         setActive(true);
       }
@@ -616,6 +732,7 @@ async function drainParkedSdkQuery(args: {
           if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
             bufferedText += `${bufferedText ? "\n\n" : ""}${block.text.trim()}`;
             flushDeadline = Date.now() + flushDebounceMs;
+            flushHardDeadline = flushHardDeadline ?? Date.now() + flushMaxHoldMs;
           } else if (blockType === "tool_use") {
             args.onEvent({
               type: "tool_started",
@@ -787,6 +904,9 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
             continue;
           }
           const message = item.message;
+          // Launches happen inside the live turn; the park needs to know about them
+          // before it starts counting down, or it closes on work already in flight.
+          query?.trackMessage(message);
           if (message.type === "system" && message.subtype === "init") {
             if (message.session_id) {
               activeProviderSessionId = message.session_id;
@@ -1071,6 +1191,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         parkIdleMs,
         hardCapMs: options.parkHardCapMs ?? PARK_HARD_CAP_MS,
         flushDebounceMs: options.parkFlushDebounceMs,
+        flushMaxHoldMs: options.parkFlushMaxHoldMs,
         onEvent: (event) => options.onParkedEvent?.(event),
         onActivityChanged: (active) => options.onParkActivityChanged?.(active),
         sessionId,

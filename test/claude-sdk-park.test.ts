@@ -749,3 +749,118 @@ describe("parked drain liveness", () => {
     expect(delivered[0]?.text).toBe(["FIRST PART", "SECOND PART"].join("\n\n"));
   });
 });
+
+function backgroundLaunch(id: string): SdkMessageLike {
+  return {
+    type: "user",
+    message: {
+      content: [
+        {
+          type: "tool_result",
+          content: `Command running in background with ID: ${id}. Output is being written to: /tmp/out.log`,
+        },
+      ],
+    },
+  } as SdkMessageLike;
+}
+
+function taskNotification(id: string): SdkMessageLike {
+  return {
+    type: "user",
+    message: { content: `<task-notification><task-id>${id}</task-id></task-notification>` },
+  } as unknown as SdkMessageLike;
+}
+
+describe("parked drain background tasks", () => {
+  const taskParkOptions = {
+    ...baseOptions,
+    parkIdleMs: 150,
+    parkHardCapMs: 10_000,
+    parkFlushDebounceMs: 20,
+  };
+
+  it("outlives the idle timeout while a background task has not reported back", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    // The CLI launches a background task, answers, and ends the turn. Claude Code
+    // re-enters itself when that task finishes, long after the idle timer would fire.
+    controlled.push(backgroundLaunch("becuy8exs"));
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+
+    const parkedEvents: AgentProviderEvent[] = [];
+    await collect(
+      runClaudeSdkTurn({
+        ...taskParkOptions,
+        queryFn: controlled.queryFn,
+        onParkedEvent: (event) => parkedEvents.push(event),
+      }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(controlled.isClosed()).toBe(false);
+
+    controlled.push(taskNotification("becuy8exs"));
+    controlled.push(textMessage("THE SUITE FINISHED"));
+    await waitUntil(() =>
+      parkedEvents.some(
+        (event) => event.type === "assistant_message_complete" && event.text === "THE SUITE FINISHED",
+      ),
+    );
+  });
+
+  it("closes on the idle timer again once the task has reported back", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(backgroundLaunch("btz538txp"));
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+
+    const parkStates: boolean[] = [];
+    await collect(
+      runClaudeSdkTurn({
+        ...taskParkOptions,
+        queryFn: controlled.queryFn,
+        onParkedEvent: () => {},
+        onParkStateChanged: (parked) => parkStates.push(parked),
+      }),
+    );
+
+    controlled.push(taskNotification("btz538txp"));
+    // Nothing is owed any more, so the ordinary idle timeout applies and the park ends.
+    await waitUntil(() => parkStates.includes(false));
+    expect(controlled.isClosed()).toBe(true);
+  });
+
+  it("flushes held text at the hard ceiling while new blocks keep resetting the debounce", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+
+    const parkedEvents: AgentProviderEvent[] = [];
+    await collect(
+      runClaudeSdkTurn({
+        ...baseOptions,
+        parkIdleMs: 3_000,
+        parkHardCapMs: 10_000,
+        parkFlushDebounceMs: 5_000,
+        parkFlushMaxHoldMs: 100,
+        queryFn: controlled.queryFn,
+        onParkedEvent: (event) => parkedEvents.push(event),
+      }),
+    );
+
+    controlled.push(textMessage("PART ONE"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Resets the 5s debounce. Without the ceiling this text would sit for five seconds.
+    controlled.push(textMessage("PART TWO"));
+
+    await waitUntil(() =>
+      parkedEvents.some(
+        (event) =>
+          event.type === "assistant_message_complete" && (event.text ?? "").includes("PART TWO"),
+      ),
+    );
+  });
+});

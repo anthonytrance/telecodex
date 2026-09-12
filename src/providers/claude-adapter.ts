@@ -88,6 +88,12 @@ interface RuntimeSession {
   /** Pushes user steering messages into an active SDK streaming-input turn. */
   sdkInputController?: ClaudeSdkInputController;
   /**
+   * Input controller of a PARKED sdk query (turn answered, CLI still alive).
+   * Closing it ends the parked drain promptly; the next turn closes it before
+   * opening a fresh query so two processes never write one session transcript.
+   */
+  parkedInputController?: ClaudeSdkInputController;
+  /**
    * Set on a freshly forked session: the next turn resumes THIS session id with
    * fork semantics (SDK forkSession / PTY --fork-session), then Claude mints a new
    * id and the field is cleared. The descriptor carries a placeholder id until then.
@@ -123,9 +129,20 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly processRegistry: ClaudeProcessRegistry;
+  /**
+   * Receives events a PARKED query produces after its turn's answer (late
+   * narration, background task notifications the CLI acted on). Set by the bot;
+   * unset means parked output is simply dropped, which is still better than the
+   * legacy behavior of killing the process and losing the work.
+   */
+  private outOfBandHandler?: (sessionId: string, event: AgentProviderEvent) => void;
 
   constructor(private readonly config: TeleCodeConfig) {
     this.processRegistry = new ClaudeProcessRegistry(claudeProcessRegistryPath(config.workspace));
+  }
+
+  setOutOfBandHandler(handler: (sessionId: string, event: AgentProviderEvent) => void): void {
+    this.outOfBandHandler = handler;
   }
 
   async createSession(
@@ -367,6 +384,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     const runtime = this.requireRuntime(sessionId);
     runtime.abortRequested = true;
     runtime.sdkAbortController?.abort();
+    // An aborted session should not leave a parked query running in the background.
+    runtime.parkedInputController?.close();
+    runtime.parkedInputController = undefined;
     runtime.pty?.pressEscape();
   }
 
@@ -475,10 +495,18 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
 
     const abortController = new AbortController();
+    // A parked query from the previous turn may still be alive. Close it first:
+    // its drain exits cleanly and the fresh query below becomes the session's
+    // only writer, so two processes can never interleave on one transcript.
+    runtime.parkedInputController?.close();
+    runtime.parkedInputController = undefined;
     const inputController = new ClaudeSdkInputController();
     runtime.sdkAbortController = abortController;
     runtime.sdkInputController = inputController;
     let partialText = "";
+    // Set when the engine hands the finished query to its parked drain: the drain
+    // then owns the controller, so this turn's teardown must not close it.
+    let parkOwnsController = false;
     try {
       for await (const event of runClaudeSdkTurn({
         sessionId: runtime.descriptor.id,
@@ -494,6 +522,16 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         inputController,
         quietStatusIntervalMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
         autoCompactWindow: this.config.claudeAutoCompactWindow,
+        parkIdleMs: this.config.claudeParkIdleMs,
+        onParkedEvent: (event) => this.handleParkedEvent(runtime, event),
+        onParkStateChanged: (parked) => {
+          if (parked) {
+            runtime.parkedInputController = inputController;
+            parkOwnsController = true;
+          } else if (runtime.parkedInputController === inputController) {
+            runtime.parkedInputController = undefined;
+          }
+        },
         onProviderSessionId: (providerSessionId) => {
           runtime.forkSourceSessionId = undefined;
           if (runtime.descriptor.metadata?.forkSourceSessionId) {
@@ -563,8 +601,34 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     } finally {
       runtime.sdkAbortController = undefined;
       runtime.sdkInputController = undefined;
-      inputController.close();
+      if (!parkOwnsController) {
+        inputController.close();
+      }
     }
+  }
+
+  /**
+   * Route one parked-drain event. Usage and model changes update the runtime
+   * silently; everything else (late answers, tool narration) goes to the
+   * out-of-band handler if the bot installed one.
+   */
+  private handleParkedEvent(runtime: RuntimeSession, event: AgentProviderEvent): void {
+    if (event.type === "usage_updated") {
+      runtime.lastUsage = {
+        inputTokens: event.inputTokens ?? runtime.lastUsage?.inputTokens ?? 0,
+        cachedInputTokens: event.cachedInputTokens ?? runtime.lastUsage?.cachedInputTokens ?? 0,
+        outputTokens: event.outputTokens ?? runtime.lastUsage?.outputTokens ?? 0,
+        contextTokens: event.contextTokens ?? runtime.lastUsage?.contextTokens ?? 0,
+      };
+      return;
+    }
+    if (event.type === "model_updated") {
+      runtime.model = event.model;
+      runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model: event.model };
+      runtime.descriptor.updatedAt = Date.now();
+      return;
+    }
+    this.outOfBandHandler?.(runtime.descriptor.id, event);
   }
 
   async compact(sessionId: string, instructions?: string): Promise<void> {
@@ -680,6 +744,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     if (sessionId) {
       const runtime = this.sessions.get(sessionId);
       runtime?.sdkAbortController?.abort();
+      runtime?.parkedInputController?.close();
       if (runtime?.pty) {
         await runtime.pty.dispose(true);
       }
@@ -690,6 +755,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     for (const runtime of this.sessions.values()) {
       runtime.sdkAbortController?.abort();
+      runtime.parkedInputController?.close();
       await runtime.pty?.dispose(true);
       this.removeRegisteredProcessSession(runtime.descriptor.id);
     }

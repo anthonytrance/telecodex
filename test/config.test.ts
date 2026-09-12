@@ -52,6 +52,7 @@ describe("loadConfig", () => {
     delete process.env.CLAUDE_TURN_IDLE_TIMEOUT;
     delete process.env.CLAUDE_CONTEXT_WINDOW;
     delete process.env.CLAUDE_AUTO_COMPACT_WINDOW;
+    delete process.env.CLAUDE_PARK_IDLE_MS;
     delete process.env.container;
   });
 
@@ -141,6 +142,7 @@ describe("loadConfig", () => {
       claudeTurnIdleTimeoutSeconds: 180,
       claudeContextWindow: 200000,
       claudeAutoCompactWindow: 200000,
+      claudeParkIdleMs: 180000,
       claudeBackend: "pty",
     });
   });
@@ -382,6 +384,7 @@ describe("loadConfig", () => {
     process.env.CLAUDE_TURN_IDLE_TIMEOUT = "60";
     process.env.CLAUDE_CONTEXT_WINDOW = "123456";
     process.env.CLAUDE_AUTO_COMPACT_WINDOW = "234567";
+    process.env.CLAUDE_PARK_IDLE_MS = "120000";
 
     const config = loadConfig();
 
@@ -396,6 +399,7 @@ describe("loadConfig", () => {
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(60);
     expect(config.claudeContextWindow).toBe(123456);
     expect(config.claudeAutoCompactWindow).toBe(234567);
+    expect(config.claudeParkIdleMs).toBe(120000);
   });
 
   it("requires unsafe launch profiles for Claude bypass permissions", () => {
@@ -477,6 +481,7 @@ describe("loadConfig", () => {
     process.env.CLAUDE_TURN_IDLE_TIMEOUT = "soon";
     process.env.CLAUDE_CONTEXT_WINDOW = "huge";
     process.env.CLAUDE_AUTO_COMPACT_WINDOW = "eventually";
+    process.env.CLAUDE_PARK_IDLE_MS = "whenever";
     process.env.MAX_FILE_SIZE = "nope";
 
     const config = loadConfig();
@@ -490,8 +495,19 @@ describe("loadConfig", () => {
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(180);
     expect(config.claudeContextWindow).toBe(200000);
     expect(config.claudeAutoCompactWindow).toBe(200000);
+    expect(config.claudeParkIdleMs).toBe(180000);
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
-    expect(warnSpy).toHaveBeenCalledTimes(10);
+    expect(warnSpy).toHaveBeenCalledTimes(11);
+  });
+
+  it("treats CLAUDE_PARK_IDLE_MS=0 as parking disabled", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CLAUDE_PARK_IDLE_MS = "0";
+
+    const config = loadConfig();
+
+    expect(config.claudeParkIdleMs).toBe(0);
   });
 
   it("parses explicit launch profiles and default selection", () => {

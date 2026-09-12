@@ -877,6 +877,59 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const isProviderForeground = (contextKey: TelegramContextKey, provider: AgentProviderKind): boolean =>
     registry.getActiveProvider(contextKey) === provider;
 
+  // A parked Claude query answered its turn, stayed alive, and has now produced
+  // more output (late narration the result message raced ahead of, a background
+  // task notification the CLI acted on once idle). Deliver that text on the lane:
+  // straight to the chat when the lane is idle, buffered for /replay when a turn
+  // is running. Everything but finished text stays in the transcript.
+  const deliverParkedClaudeEvent = (sessionId: string, event: AgentProviderEvent): void => {
+    if (event.type !== "assistant_message_complete") {
+      return;
+    }
+    const text = event.text?.trim();
+    if (!text) {
+      return;
+    }
+    let contextKey: TelegramContextKey | undefined;
+    for (const [key, descriptor] of claudeSessions) {
+      if (descriptor.id === sessionId) {
+        contextKey = key;
+        break;
+      }
+    }
+    if (!contextKey) {
+      return;
+    }
+    if (isProviderBusy(contextKey, "claude")) {
+      outputBuffer.append(sessionId, {
+        kind: "assistant",
+        text,
+        priority: false,
+        metadata: { provider: "claude" },
+      });
+      bridgeLog("park", `buffered parked claude output session=${sessionId} chars=${text.length}`);
+      return;
+    }
+    const parsed = parseContextKey(contextKey);
+    void (async () => {
+      for (const chunk of splitMarkdownForTelegram(text)) {
+        await sendTextMessage(bot.api, parsed.chatId, chunk.text, {
+          parseMode: chunk.parseMode,
+          fallbackText: chunk.fallbackText,
+          messageThreadId: parsed.messageThreadId,
+        });
+      }
+      bridgeLog("park", `delivered parked claude output session=${sessionId} chars=${text.length}`);
+    })().catch((error) => {
+      console.warn("Failed to deliver parked Claude output", error);
+      bridgeLog("park", `failed to deliver parked claude output session=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  };
+
+  if (typeof claudeAdapter?.setOutOfBandHandler === "function") {
+    claudeAdapter.setOutOfBandHandler(deliverParkedClaudeEvent);
+  }
+
   const persistAgentSessionState = (): void => {
     try {
       agentSessionStore.save(agentSessions.serialize());

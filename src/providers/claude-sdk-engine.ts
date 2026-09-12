@@ -45,6 +45,21 @@ export interface ClaudeSdkTurnOptions {
   quietStatusIntervalMs?: number;
   /** Effective window Claude Code uses when deciding when to auto-compact. */
   autoCompactWindow?: number;
+  /**
+   * How long to keep the finished query alive after the turn's answer, draining
+   * whatever the CLI still emits and forwarding it through onParkedEvent. The
+   * CLI buffers background <task-notification>s and resume rescues in its own
+   * pending queue; killing the process at the turn boundary turned each queued
+   * item into a dead turn and a lost answer. 0 disables parking (legacy
+   * teardown-at-answer behavior).
+   */
+  parkIdleMs?: number;
+  /** Absolute ceiling on one park, whatever the traffic. Defaults to PARK_HARD_CAP_MS. */
+  parkHardCapMs?: number;
+  /** Receives events the CLI produced after the turn's answer (parked drain). */
+  onParkedEvent?: (event: AgentProviderEvent) => void;
+  /** Signals when the parked drain takes and releases the query + input controller. */
+  onParkStateChanged?: (parked: boolean) => void;
   /** Injectable for tests; defaults to the real SDK query(). */
   queryFn?: (input: {
     prompt: string | AsyncIterable<SdkUserMessageLike>;
@@ -273,6 +288,153 @@ export async function recoverSdkContextFromTranscript(
   }
 }
 
+/** Absolute ceiling on one parked query, whatever the traffic. */
+export const PARK_HARD_CAP_MS = 30 * 60_000;
+
+/**
+ * Wait for the next parked message, giving up after timeoutMs. Resolves undefined
+ * on timeout — unlike waitForSdkMessage, which keeps waiting and only reports quiet
+ * periods, a parked drain's whole job is to end when the CLI goes silent.
+ */
+async function waitForParkedMessage(
+  nextMessage: Promise<IteratorResult<SdkMessageLike>>,
+  timeoutMs: number,
+): Promise<IteratorResult<SdkMessageLike> | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      nextMessage,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Keep a finished query alive and forward whatever the CLI still says. The turn's
+ * answer is already delivered; everything here is bonus material (late narration
+ * the result message raced ahead of, background task notifications the CLI acts on
+ * once it goes idle). Every failure is swallowed: parking must never turn a
+ * completed turn into an error, and closing the input controller from outside ends
+ * the drain promptly because the SDK query finishes once its input does.
+ */
+async function drainParkedSdkQuery(args: {
+  query: AsyncIterable<SdkMessageLike> & { close?: () => void };
+  inputController?: ClaudeSdkInputController;
+  parkIdleMs: number;
+  hardCapMs: number;
+  onEvent: (event: AgentProviderEvent) => void;
+  providerSessionId: string | undefined;
+  sessionId: string;
+  jobId: string;
+}): Promise<void> {
+  const startedAt = Date.now();
+  const sessionLabel = args.providerSessionId ?? args.sessionId;
+  bridgeLog("park", `keeping finished sdk query alive session=${sessionLabel} idleMs=${args.parkIdleMs}`);
+  const iterator = args.query[Symbol.asyncIterator]();
+  try {
+    let bufferedText = "";
+    const flushText = (): void => {
+      const text = bufferedText.trim();
+      bufferedText = "";
+      if (text) {
+        args.onEvent({
+          type: "assistant_message_complete",
+          sessionId: args.sessionId,
+          jobId: args.jobId,
+          text,
+        });
+      }
+    };
+    while (true) {
+      const remaining = Math.min(args.parkIdleMs, args.hardCapMs - (Date.now() - startedAt));
+      if (remaining <= 0) {
+        break;
+      }
+      const outcome = await waitForParkedMessage(iterator.next(), remaining);
+      // Undefined = park went quiet (or hit its cap); done = the query finished
+      // (input closed from outside, CLI exited). Either way the park is over.
+      if (!outcome || outcome.done) {
+        break;
+      }
+      const message = outcome.value;
+      if (message.type === "assistant") {
+        const model = message.message?.model;
+        if (!model || model === "<synthetic>") {
+          continue;
+        }
+        for (const block of message.message?.content ?? []) {
+          const blockType = typeof block.type === "string" ? block.type : "";
+          if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
+            bufferedText += `${bufferedText ? "\n\n" : ""}${block.text.trim()}`;
+          } else if (blockType === "tool_use") {
+            args.onEvent({
+              type: "tool_started",
+              sessionId: args.sessionId,
+              jobId: args.jobId,
+              toolName: typeof block.name === "string" && block.name ? block.name : "tool",
+              text: summarizeSdkToolInput(block.input),
+            });
+          }
+        }
+        continue;
+      }
+      if (message.type === "user") {
+        for (const block of message.message?.content ?? []) {
+          if (block.type === "tool_result") {
+            args.onEvent({
+              type: block.is_error === true ? "tool_failed" : "tool_completed",
+              sessionId: args.sessionId,
+              jobId: args.jobId,
+              toolName: "tool",
+            });
+          }
+        }
+        continue;
+      }
+      if (message.type === "result") {
+        if (message.subtype !== "success") {
+          bridgeLog("park", `parked sdk turn ended: ${message.subtype ?? "?"} session=${sessionLabel}`);
+          break;
+        }
+        // A result closes an injected turn. Its text usually repeats the assistant
+        // blocks already buffered, so append only what is genuinely new, then
+        // deliver the burst now instead of holding it until the park times out.
+        const resultText = (message.result ?? "").trim();
+        if (resultText && resultText !== bufferedText.trim()) {
+          bufferedText += `${bufferedText ? "\n\n" : ""}${resultText}`;
+        }
+        flushText();
+        continue;
+      }
+    }
+    flushText();
+    bridgeLog("park", `park ended after ${Date.now() - startedAt}ms session=${sessionLabel}`);
+  } catch (error) {
+    bridgeLog(
+      "park",
+      `park drain failed (turn unaffected): ${error instanceof Error ? error.message : String(error)} session=${sessionLabel}`,
+    );
+  } finally {
+    try {
+      args.inputController?.close();
+    } catch {
+      // Drain teardown must never throw.
+    }
+    try {
+      args.query.close?.();
+    } catch {
+      // Drain teardown must never throw.
+    }
+  }
+}
+
 export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIterable<AgentProviderEvent> {
   const queryFn = options.queryFn ?? (await loadSdkQuery());
   const { sessionId, jobId } = options;
@@ -283,6 +445,14 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   let lastContextTokens: number | undefined;
   let activeProviderSessionId = options.resume;
   const inputController = options.inputController;
+  const parkIdleMs = Math.max(0, options.parkIdleMs ?? 0);
+  const parkEnabled = parkIdleMs > 0 && Boolean(options.onParkedEvent);
+  // Set the moment the turn's answer is accepted; the outer finally then hands
+  // the query to the parked drain, which owns closing it and the input controller.
+  // Hoisted because the drain must launch on every generator exit (normal return,
+  // early consumer return, throw) or the query and its CLI process would leak.
+  let parked = false;
+  let activeQuery: AsyncIterable<SdkMessageLike> & { close?: () => void } | undefined;
 
   try {
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -307,6 +477,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         ? initialPromptAndLiveInput(retryPrompt, inputController)
         : retryPrompt;
       const query = queryFn({ prompt: sdkPrompt, options: sdkOptions });
+      activeQuery = query;
       let sawResult = false;
       let sawTerminalResult = false;
       let finalAssistantText = "";
@@ -485,6 +656,11 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
               }
               const completionText = resultText || finalAssistantText.trim();
               if (completionText) {
+                if (parkEnabled) {
+                  // Before the yield: if the consumer walks away at this yield the
+                  // outer finally must still find the query parked, not leak it.
+                  parked = true;
+                }
                 yield {
                   type: "assistant_message_complete",
                   sessionId,
@@ -542,8 +718,13 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
           // of the provider event contract; ignored deliberately.
         }
       } finally {
-        inputController?.close();
-        query.close?.();
+        // A parked query outlives this generator: the drain closes it (and the
+        // input controller) when the CLI goes quiet, the cap hits, or the adapter
+        // closes the controller to make room for the next turn.
+        if (!parked) {
+          inputController?.close();
+          query.close?.();
+        }
       }
 
       if (!sawResult) {
@@ -585,7 +766,25 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
       }
     }
   } finally {
-    inputController?.close();
+    if (parked && activeQuery) {
+      // Single launch site for the parked drain: every exit path funnels here,
+      // so the query can never be parked without a reader and never leaked.
+      options.onParkStateChanged?.(true);
+      void drainParkedSdkQuery({
+        query: activeQuery,
+        inputController,
+        parkIdleMs,
+        hardCapMs: options.parkHardCapMs ?? PARK_HARD_CAP_MS,
+        onEvent: (event) => options.onParkedEvent?.(event),
+        providerSessionId: activeProviderSessionId,
+        sessionId,
+        jobId,
+      }).finally(() => {
+        options.onParkStateChanged?.(false);
+      });
+    } else {
+      inputController?.close();
+    }
   }
 }
 

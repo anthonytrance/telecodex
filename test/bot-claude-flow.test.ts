@@ -45,6 +45,7 @@ const mockClaude = vi.hoisted(() => {
   const queuedReplies: string[] = [];
   let failNextPromptDelivery = false;
   let artifactFileName: string | undefined;
+  let outOfBandHandler: ((sessionId: string, event: Record<string, unknown>) => void) | undefined;
 
   return {
     prompts,
@@ -55,6 +56,12 @@ const mockClaude = vi.hoisted(() => {
       artifactFileName = name;
     },
     getArtifactFileName: () => artifactFileName,
+    setOutOfBandHandler: (handler: ((sessionId: string, event: Record<string, unknown>) => void) | undefined) => {
+      outOfBandHandler = handler;
+    },
+    emitOutOfBand: (sessionId: string, event: Record<string, unknown>): void => {
+      outOfBandHandler?.(sessionId, event);
+    },
     createSession,
     resumeSession,
     getSessionInfo,
@@ -130,6 +137,7 @@ const mockClaude = vi.hoisted(() => {
       queuedReplies.length = 0;
       failNextPromptDelivery = false;
       artifactFileName = undefined;
+      outOfBandHandler = undefined;
       createSession.mockReset();
       resumeSession.mockReset();
       getSessionInfo.mockReset();
@@ -193,6 +201,10 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
       mockClaude.setActiveProviderSessionId(descriptor.providerSessionId);
       mockClaude.createSession(options);
       return descriptor;
+    }
+
+    setOutOfBandHandler(handler: (sessionId: string, event: Record<string, unknown>) => void) {
+      mockClaude.setOutOfBandHandler(handler);
     }
 
     async resumeSession(session: unknown) {
@@ -1443,6 +1455,46 @@ describe("Claude bot flow", () => {
     await bot.disposeProviders();
 
     expect(mockClaude.dispose).toHaveBeenCalledWith();
+  });
+
+  it("delivers parked out-of-band Claude output straight to the lane", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+
+    // The turn's finally clears the busy flag after the final answer is delivered,
+    // so keep emitting until the lane is idle enough for direct delivery. While
+    // still busy the event is buffered by design, exactly as in production.
+    await waitFor(() => {
+      mockClaude.emitOutOfBand("claude-provider-1", {
+        type: "assistant_message_complete",
+        sessionId: "claude-provider-1",
+        jobId: "parked-job",
+        text: "LATE ARRIVAL",
+      });
+      return sent.some((entry) => entry.text?.includes("LATE ARRIVAL"));
+    });
+  });
+
+  it("drops parked output for a session the lane does not know", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+
+    const before = sent.length;
+    mockClaude.emitOutOfBand("claude-provider-does-not-exist", {
+      type: "assistant_message_complete",
+      sessionId: "claude-provider-does-not-exist",
+      jobId: "parked-job",
+      text: "SHOULD NOT APPEAR",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(sent.slice(before).some((entry) => entry.text?.includes("SHOULD NOT APPEAR"))).toBe(false);
   });
 });
 

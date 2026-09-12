@@ -53,6 +53,12 @@ export interface TeleCodeConfig {
   claudeContextWindow: number;
   /** Effective Claude Code window used to trigger automatic compaction. */
   claudeAutoCompactWindow: number;
+  /**
+   * How long an answered SDK query stays alive after its turn ("parked"), so late
+   * narration and background task notifications reach Telegram instead of dying
+   * with the process. 0 disables parking (legacy teardown-at-answer behavior).
+   */
+  claudeParkIdleMs: number;
   /** Default Claude engine for contexts that never ran /backend: pty or sdk. */
   claudeBackend: "pty" | "sdk";
 }
@@ -132,6 +138,16 @@ export function loadConfig(): TeleCodeConfig {
     200000,
     "CLAUDE_AUTO_COMPACT_WINDOW",
   );
+  const rawClaudeParkIdleMs = optionalString(process.env.CLAUDE_PARK_IDLE_MS);
+  let claudeParkIdleMs = 180_000;
+  if (rawClaudeParkIdleMs !== undefined) {
+    const parsed = Number(rawClaudeParkIdleMs);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      console.warn(`Invalid CLAUDE_PARK_IDLE_MS value: "${rawClaudeParkIdleMs}". Falling back to ${claudeParkIdleMs}.`);
+    } else {
+      claudeParkIdleMs = parsed;
+    }
+  }
   const rawClaudeBackend = optionalString(process.env.CLAUDE_BACKEND) ?? "pty";
   if (rawClaudeBackend !== "pty" && rawClaudeBackend !== "sdk") {
     throw new Error(`CLAUDE_BACKEND must be "pty" or "sdk", got: ${rawClaudeBackend}`);
@@ -169,6 +185,7 @@ export function loadConfig(): TeleCodeConfig {
     claudeTurnIdleTimeoutSeconds,
     claudeContextWindow,
     claudeAutoCompactWindow,
+    claudeParkIdleMs,
     claudeBackend: rawClaudeBackend,
   };
 }
